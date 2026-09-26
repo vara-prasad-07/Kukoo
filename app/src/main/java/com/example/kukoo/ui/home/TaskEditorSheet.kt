@@ -49,6 +49,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
 import com.example.kukoo.domain.Priority
+import com.example.kukoo.domain.Recurrence
 import com.example.kukoo.domain.Task
 import com.example.kukoo.domain.TimeFormat
 import com.example.kukoo.ui.EditorState
@@ -69,7 +70,14 @@ fun TaskEditorSheet(
     editor: EditorState,
     format: TimeFormat,
     clock: Clock,
-    onSave: (title: String, deadline: Long?, durationMin: Int, priority: Priority) -> Unit,
+    onSave: (
+        title: String,
+        deadline: Long?,
+        durationMin: Int,
+        priority: Priority,
+        notes: String?,
+        recurrence: Recurrence
+    ) -> Unit,
     onDismiss: () -> Unit
 ) {
     val existing = editor.task
@@ -79,6 +87,8 @@ fun TaskEditorSheet(
     var deadline by rememberSaveable(existing?.id) { mutableStateOf(existing?.deadline) }
     var duration by rememberSaveable(existing?.id) { mutableIntStateOf(existing?.durationMin ?: Task.DEFAULT_DURATION_MIN) }
     var priority by rememberSaveable(existing?.id) { mutableStateOf(existing?.priority ?: Priority.MEDIUM) }
+    var notes by rememberSaveable(existing?.id) { mutableStateOf(existing?.notes ?: "") }
+    var recurrence by rememberSaveable(existing?.id) { mutableStateOf(existing?.recurrence ?: Recurrence.NONE) }
     var pickDate by remember { mutableStateOf(false) }
     var pickTime by remember { mutableStateOf(false) }
 
@@ -158,6 +168,31 @@ fun TaskEditorSheet(
                 }
             }
 
+            Field("Repeats") {
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Recurrence.entries.forEach { r ->
+                        FilterChip(
+                            selected = r == recurrence,
+                            onClick = { recurrence = r },
+                            label = { Text(r.label) }
+                        )
+                    }
+                }
+            }
+
+            OutlinedTextField(
+                value = notes,
+                onValueChange = { if (it.length <= Task.MAX_NOTES_LENGTH) notes = it },
+                label = { Text("Notes (optional)") },
+                minLines = 2,
+                maxLines = 4,
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                modifier = Modifier.fillMaxWidth()
+            )
+
             editor.error?.let {
                 Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
             }
@@ -168,7 +203,7 @@ fun TaskEditorSheet(
             ) {
                 TextButton(onClick = onDismiss) { Text("Cancel") }
                 Button(
-                    onClick = { onSave(title, deadline, duration, priority) },
+                    onClick = { onSave(title, deadline, duration, priority, notes.ifBlank { null }, recurrence) },
                     enabled = title.isNotBlank()
                 ) { Text("Save") }
             }

@@ -9,6 +9,7 @@ import com.example.kukoo.domain.Outcome
 import com.example.kukoo.domain.PlanScope
 import com.example.kukoo.domain.Priority
 import com.example.kukoo.domain.QueryScope
+import com.example.kukoo.domain.Recurrence
 import com.example.kukoo.domain.Task
 import com.example.kukoo.domain.TaskCommand
 import com.example.kukoo.domain.TaskEngine
@@ -46,6 +47,211 @@ class TaskEngineTest {
     private fun Rig.byTitle(title: String) = store.all().first { it.title == title }
     private fun title(q: String) = TaskRef.ByTitle(q)
 
+    // ---- recurrence & snooze -------------------------------------------------------------
+
+    @Test
+    fun completingARecurringTask_spawnsTheNextOccurrence() {
+        val r = rig(listOf(Task(title = "Standup", deadline = today(16), durationMin = 15, priority = Priority.HIGH,
+            createdAt = 0, recurrence = Recurrence.DAILY, notes = "Room 4")))
+        val res = r.run(TaskCommand.CompleteTask(title("standup")))
+        assertEquals(Outcome.OK, res.outcome)
+        assertEquals("Done. I marked Standup as done. The next one is due tomorrow at 4 PM.", res.spoken)
+        val all = r.store.all()
+        assertEquals(2, all.size)
+        val next = all.first { !it.isDone }
+        assertEquals(tomorrow(16), next.deadline)
+        assertEquals(Recurrence.DAILY, next.recurrence)
+        assertEquals("Room 4", next.notes)
+        assertEquals(Priority.HIGH, next.priority)
+        assertEquals(15, next.durationMin)
+
+        // Undo removes the spawned copy and reopens the original.
+        r.run(TaskCommand.Undo)
+        assertEquals(1, r.store.all().size)
+        assertEquals(TaskStatus.OPEN, r.store.all().single().status)
+    }
+
+    @Test
+    fun weekdaysRecurrence_skipsTheWeekend() {
+        // Clock is Friday: next weekday is Monday.
+        val r = rig(listOf(Task(title = "Report", deadline = today(17), createdAt = 0, recurrence = Recurrence.WEEKDAYS)))
+        r.run(TaskCommand.CompleteTask(title("report")))
+        val next = r.store.all().first { !it.isDone }
+        assertEquals(millis(TODAY.plusDays(3), 17), next.deadline)
+    }
+
+    @Test
+    fun weeklyAndMonthlyRecurrence_advance() {
+        val r = rig(listOf(
+            Task(title = "Weekly", deadline = today(17), createdAt = 0, recurrence = Recurrence.WEEKLY),
+            Task(title = "Monthly", deadline = today(17), createdAt = 0, recurrence = Recurrence.MONTHLY)
+        ))
+        r.run(TaskCommand.CompleteTask(title("weekly")))
+        r.run(TaskCommand.CompleteTask(title("monthly")))
+        val open = r.store.all().filter { !it.isDone }
+        assertEquals(millis(TODAY.plusDays(7), 17), open.first { it.title == "Weekly" }.deadline)
+        assertEquals(millis(TODAY.plusMonths(1), 17), open.first { it.title == "Monthly" }.deadline)
+    }
+
+    @Test
+    fun completingANonRecurringTask_addsNothing() {
+        val r = rig()
+        val before = r.store.all().size
+        r.run(TaskCommand.CompleteTask(title("follow-up")))
+        assertEquals(before, r.store.all().size)
+    }
+
+    @Test
+    fun snooze_shiftsOverdueAndTodaysTasks_notTomorrows() {
+        val r = rig()
+        val res = r.run(TaskCommand.Snooze(15))
+        assertEquals("Snoozed tasks by 15 minutes.", res.spoken)
+        assertEquals(today(16, 45), r.byTitle("Follow-up").deadline)
+        assertEquals(today(17, 35), r.byTitle("Client Deck").deadline)
+        assertEquals(tomorrow(11), r.byTitle("Design Review").deadline)
+
+        r.run(TaskCommand.Undo)
+        assertEquals(today(16, 30), r.byTitle("Follow-up").deadline)
+    }
+
+    @Test
+    fun snooze_withNothingDue_saysSo() {
+        val res = rig(listOf(Task(title = "Later", deadline = tomorrow(9), createdAt = 0))).run(TaskCommand.Snooze())
+        assertEquals(Outcome.OK, res.outcome)
+        assertTrue(res.spoken.contains("nothing to snooze"))
+    }
+
+    @Test
+    fun updatingNotesAndRecurrence_works() {
+        val r = rig()
+        val res = r.run(TaskCommand.UpdateTask(title("client deck"), TaskPatch(recurrence = Recurrence.WEEKLY, notes = "Bring slides")))
+        assertEquals(Outcome.OK, res.outcome)
+        assertEquals(Recurrence.WEEKLY, r.byTitle("Client Deck").recurrence)
+        assertEquals("Bring slides", r.byTitle("Client Deck").notes)
+        r.run(TaskCommand.UpdateTask(title("client deck"), TaskPatch(notes = "  ")))
+        assertNull(r.byTitle("Client Deck").notes)
+    }
+
+    @Test
+    fun add_recurringAtAPastHour_startsTomorrow() {
+        val r = rig(emptyList()) // clock is 3 PM
+        val res = r.run(
+            TaskCommand.AddTask(
+                "finish daily standup",
+                DeadlineSpec.Relative(time = LocalTime.of(10, 0)),
+                recurrence = Recurrence.DAILY
+            )
+        )
+        assertEquals(Outcome.OK, res.outcome)
+        assertEquals("Added 'Finish daily standup' starting tomorrow at 10 AM (repeats daily).", res.spoken)
+        assertEquals(tomorrow(10), r.store.all().single().deadline)
+    }
+
+    @Test
+    fun add_bareTimeStillAheadToday_staysToday_andExplicitPastTodayRollsOver() {
+        val r = rig(emptyList())
+        r.run(TaskCommand.AddTask("call dad", DeadlineSpec.Relative(time = LocalTime.of(17, 0))))
+        assertEquals(today(17), r.store.all().single().deadline)
+        r.run(TaskCommand.AddTask("x", DeadlineSpec.Relative(DayRef.Today, LocalTime.of(10, 0))))
+        assertEquals(tomorrow(10), r.byTitle("X").deadline)
+    }
+
+    @Test
+    fun exactPastDeadline_fromTheEditor_isStillRejected() {
+        val res = rig(emptyList()).run(TaskCommand.AddTask("old", DeadlineSpec.Exact(today(9))))
+        assertEquals(Outcome.REJECTED, res.outcome)
+    }
+
+    @Test
+    fun updatingATaskThatDoesNotExist_withATime_selfHealsIntoAdd() {
+        val r = rig(emptyList())
+        val res = r.run(
+            TaskCommand.UpdateTask(
+                title("gym"),
+                TaskPatch(deadline = DeadlineSpec.Relative(time = LocalTime.of(12, 0)), recurrence = Recurrence.DAILY)
+            )
+        )
+        assertEquals(Outcome.OK, res.outcome)
+        val gym = r.store.all().single()
+        assertEquals("Gym", gym.title)
+        assertEquals(Recurrence.DAILY, gym.recurrence)
+        assertEquals(tomorrow(12), gym.deadline) // 3 PM now, so noon rolls to tomorrow
+    }
+
+    @Test
+    fun updatingAMissingTask_withNothingToCreateFrom_stillSaysNotFound() {
+        val res = rig().run(TaskCommand.UpdateTask(title("gym"), TaskPatch(notes = "x")))
+        assertEquals(Outcome.REJECTED, res.outcome)
+        assertTrue(res.spoken.contains("couldn't find"))
+    }
+
+    @Test
+    fun implicitCreation_fromPlainPhrases() {
+        val parser = com.example.kukoo.ai.RuleBasedIntentParser()
+        val r = rig(emptyList())
+        val cmd = parser.parseNow("workout at 6pm")
+        assertTrue(cmd.toString(), cmd is TaskCommand.AddTask)
+        r.run(cmd)
+        val t = r.store.all().single()
+        assertEquals("Workout", t.title)
+        assertEquals(today(18), t.deadline)
+
+        val gym = parser.parseNow("gym everyday at 12pm") as TaskCommand.AddTask
+        assertEquals("gym", gym.title)
+        assertEquals(Recurrence.DAILY, gym.recurrence)
+        assertTrue(parser.parseNow("read book at 9pm") is TaskCommand.AddTask)
+        // Finishing / asking phrases are not new tasks.
+        assertTrue(parser.parseNow("what is due at 5pm") !is TaskCommand.AddTask)
+        assertTrue(parser.parseNow("mark gym done at 5pm") !is TaskCommand.AddTask)
+    }
+
+    @Test
+    fun deadlineAt8AM_whenItIs2PM_meansTomorrow() {
+        val r = rig(listOf(Task(title = "Gym", deadline = tomorrow(18), createdAt = 0)), clockAt(14))
+        r.run(TaskCommand.UpdateTask(title("gym"), TaskPatch(deadline = DeadlineSpec.Relative(time = LocalTime.of(8, 0)))))
+        // Task is due tomorrow, so its own date is kept: tomorrow 8 AM.
+        assertEquals(tomorrow(8), r.byTitle("Gym").deadline)
+        r.run(TaskCommand.AddTask("run", DeadlineSpec.Relative(DayRef.Today, LocalTime.of(8, 0))))
+        assertEquals(tomorrow(8), r.byTitle("Run").deadline)
+    }
+
+    // ---- undo ----------------------------------------------------------------------------
+
+    @Test
+    fun undo_withNothingToUndo_isRejected() {
+        val res = rig().run(TaskCommand.Undo)
+        assertEquals(Outcome.REJECTED, res.outcome)
+        assertEquals("There is nothing to undo.", res.spoken)
+    }
+
+    @Test
+    fun undo_revertsAdd_complete_andDelete_oneStepAtATime() {
+        val r = rig()
+        r.run(TaskCommand.AddTask("Call mum"))
+        assertEquals(Outcome.OK, r.run(TaskCommand.Undo).outcome)
+        assertTrue(r.store.all().none { it.title == "Call mum" })
+
+        r.run(TaskCommand.CompleteTask(title("follow-up")))
+        assertEquals("Undid last action.", r.run(TaskCommand.Undo).spoken)
+        assertEquals(TaskStatus.OPEN, r.byTitle("Follow-up").status)
+
+        r.run(TaskCommand.DeleteTask(title("expense report")))
+        r.run(TaskCommand.Undo)
+        assertEquals(20, r.byTitle("Expense report").durationMin)
+
+        // Single step: a second undo has nothing left.
+        assertEquals(Outcome.REJECTED, r.run(TaskCommand.Undo).outcome)
+    }
+
+    @Test
+    fun undo_revertsAnUpdate() {
+        val r = rig()
+        val before = r.byTitle("Client Deck").deadline
+        r.run(TaskCommand.UpdateTask(title("client deck"), TaskPatch(deadline = DeadlineSpec.Relative(DayRef.Tomorrow))))
+        r.run(TaskCommand.Undo)
+        assertEquals(before, r.byTitle("Client Deck").deadline)
+    }
+
     // ---- add -----------------------------------------------------------------------------
 
     @Test
@@ -71,12 +277,12 @@ class TaskEngineTest {
     }
 
     @Test
-    fun add_deadlineInThePast_isRejected_andNothingIsSaved() {
+    fun add_relativeTimeInThePast_rollsToTomorrow() {
         val r = rig(emptyList())
         val res = r.run(TaskCommand.AddTask("call mom", DeadlineSpec.Relative(DayRef.Today, LocalTime.of(9, 0))))
-        assertEquals(Outcome.REJECTED, res.outcome)
-        assertEquals("today at 9 AM has already passed, so I didn't add Call mom.", res.spoken)
-        assertTrue(r.store.all().isEmpty())
+        assertEquals(Outcome.OK, res.outcome)
+        assertEquals("Added Call mom, due tomorrow at 9 AM, 30 minutes.", res.spoken)
+        assertEquals(tomorrow(9), r.store.all().single().deadline)
     }
 
     @Test
@@ -124,11 +330,11 @@ class TaskEngineTest {
     }
 
     @Test
-    fun update_rejectsPastDeadline_keepsOldValue() {
+    fun update_relativePastTime_rollsToTomorrow() {
         val r = rig()
         val res = r.run(TaskCommand.UpdateTask(title("follow up"), TaskPatch(deadline = DeadlineSpec.Relative(DayRef.Today, LocalTime.of(9, 0)))))
-        assertEquals(Outcome.REJECTED, res.outcome)
-        assertEquals(today(16, 30), r.byTitle("Follow-up").deadline)
+        assertEquals(Outcome.OK, res.outcome)
+        assertEquals(tomorrow(9), r.byTitle("Follow-up").deadline)
     }
 
     @Test

@@ -23,8 +23,12 @@ class TaskEngine(
     /** The task most recently talked about, so "change the deadline to 6 PM" has a target. */
     private var lastTaskId: Long? = null
 
+    /** Reverses the last successful mutation. Single step; cleared when a session starts or ends. */
+    private var undoAction: (() -> Unit)? = null
+
     fun resetContext() {
         lastTaskId = null
+        undoAction = null
     }
 
     fun tasks(): List<Task> = store.all()
@@ -38,6 +42,8 @@ class TaskEngine(
             is TaskCommand.ReopenTask -> setDone(command.ref, done = false)
             is TaskCommand.DeleteTask -> delete(command)
             is TaskCommand.Replan -> replan(command.scope)
+            TaskCommand.Undo -> undo()
+            is TaskCommand.Snooze -> snooze(command.minutes)
             TaskCommand.EndCall -> EngineResult(Outcome.END_CALL, "Okay, goodbye. Your tasks are up to date.")
             is TaskCommand.Unsupported -> EngineResult(
                 Outcome.UNSUPPORTED,
@@ -126,6 +132,76 @@ class TaskEngine(
 
     // ---- mutations -----------------------------------------------------------------------
 
+    /**
+     * "gym every day at 12pm" can be misheard as an edit of a task that doesn't exist. When the target title
+     * matches nothing and the patch says when / how important / how often, treat it as the task the user
+     * meant to create. A patch that only renames or edits notes still reports "couldn't find".
+     */
+    private fun selfHealToAdd(cmd: TaskCommand.UpdateTask): TaskCommand.AddTask? {
+        val ref = cmd.ref as? TaskRef.ByTitle ?: return null
+        val patch = cmd.patch
+        val describesATask = (patch.deadline != null && !patch.clearDeadline) ||
+            patch.priority != null || (patch.recurrence != null && patch.recurrence != Recurrence.NONE)
+        if (!describesATask || cleanTitle(ref.query).isEmpty()) return null
+        if (TitleMatcher.resolve(ref.query, store.all()) != TitleMatcher.Match.None) return null
+        return TaskCommand.AddTask(
+            title = ref.query,
+            deadline = patch.deadline,
+            durationMin = patch.durationMin,
+            priority = patch.priority,
+            recurrence = patch.recurrence ?: Recurrence.NONE,
+            notes = patch.notes
+        )
+    }
+
+    /** Next due time for a repeating task, moved past "now" so finishing a stale one doesn't spawn an overdue copy. */
+    private fun nextDeadline(task: Task): Long? {
+        var next = task.deadline?.let { resolver.nextOccurrence(it, task.recurrence) } ?: return null
+        val now = clock.millis()
+        var guard = 0
+        while (next <= now && guard++ < MAX_CATCH_UP) next = resolver.nextOccurrence(next, task.recurrence)
+        return next
+    }
+
+    private fun snooze(minutes: Int): EngineResult {
+        if (minutes < 1 || minutes > MAX_SNOOZE_MIN) {
+            return reject("I can snooze for between 1 minute and ${MAX_SNOOZE_MIN / 60} hours.")
+        }
+        val endOfToday = resolver.endOfDay(resolver.today())
+        val targets = store.all().filter { !it.isDone && it.deadline != null && it.deadline <= endOfToday }
+        if (targets.isEmpty()) return EngineResult(Outcome.OK, "Nothing is due today, so there is nothing to snooze.")
+
+        val shift = minutes * MILLIS_PER_MINUTE
+        targets.forEach { store.update(it.copy(deadline = it.deadline!! + shift)) }
+        undoAction = { targets.forEach { store.update(it) } }
+        return EngineResult(Outcome.OK, "Snoozed tasks by $minutes minutes.", taskIds = targets.map { it.id })
+    }
+
+    private fun recurrenceWord(r: Recurrence) = when (r) {
+        Recurrence.NONE -> "never"
+        Recurrence.DAILY -> "daily"
+        Recurrence.WEEKDAYS -> "on weekdays"
+        Recurrence.WEEKLY -> "weekly"
+        Recurrence.MONTHLY -> "monthly"
+    }
+
+    private fun repeatWord(r: Recurrence) = when (r) {
+        Recurrence.NONE -> "never"
+        Recurrence.DAILY -> "every day"
+        Recurrence.WEEKDAYS -> "every weekday"
+        Recurrence.WEEKLY -> "every week"
+        Recurrence.MONTHLY -> "every month"
+    }
+
+    private fun cleanNotes(raw: String?): String? = raw?.trim()?.replace(Regex("\\s+"), " ")?.takeIf { it.isNotEmpty() }
+
+    private fun undo(): EngineResult {
+        val action = undoAction ?: return reject("There is nothing to undo.")
+        undoAction = null
+        action()
+        return EngineResult(Outcome.OK, "Undid last action.")
+    }
+
     private fun add(cmd: TaskCommand.AddTask): EngineResult {
         val now = clock.millis()
         val title = cleanTitle(cmd.title)
@@ -140,26 +216,46 @@ class TaskEngine(
             return reject("${format.deadline(deadline)} has already passed, so I didn't add $title.")
         }
 
+        val notes = cleanNotes(cmd.notes)
+        if (notes != null && notes.length > Task.MAX_NOTES_LENGTH) return reject("Those notes are too long.")
+
         val saved = store.insert(
             Task(
                 title = title,
                 deadline = deadline,
                 durationMin = duration,
                 priority = cmd.priority ?: Priority.MEDIUM,
-                createdAt = now
+                createdAt = now,
+                recurrence = cmd.recurrence,
+                notes = notes
             )
         )
         lastTaskId = saved.id
+        undoAction = { store.delete(saved.id); if (lastTaskId == saved.id) lastTaskId = null }
         val whenPart = if (deadline != null) "due ${format.deadline(deadline)}" else "with no deadline"
+        if (cmd.recurrence != Recurrence.NONE && deadline != null &&
+            (cmd.deadline as? DeadlineSpec.Relative)?.day.let { it == null || it == DayRef.Today } &&
+            cmd.deadline is DeadlineSpec.Relative &&
+            resolver.toLocal(deadline).toLocalDate() == resolver.today().plusDays(1)
+        ) {
+            // Today's time had already passed, so the series starts tomorrow.
+            return EngineResult(
+                Outcome.OK,
+                "Added '$title' starting ${format.deadline(deadline)} (repeats ${recurrenceWord(cmd.recurrence)}).",
+                taskIds = listOf(saved.id)
+            )
+        }
+        val repeats = if (cmd.recurrence != Recurrence.NONE) " Repeats ${repeatWord(cmd.recurrence)}." else ""
         return EngineResult(
             Outcome.OK,
-            "Added $title, $whenPart, ${format.duration(duration)}.",
+            "Added $title, $whenPart, ${format.duration(duration)}.$repeats",
             taskIds = listOf(saved.id)
         )
     }
 
     private fun update(cmd: TaskCommand.UpdateTask): EngineResult {
         if (cmd.patch.isEmpty) return reject("There was nothing to change.")
+        selfHealToAdd(cmd)?.let { return add(it) }
         val task = when (val r = resolve(cmd.ref, prefer = { !it.isDone })) {
             is Resolved.Fail -> return r.result
             is Resolved.Ok -> r.task
@@ -215,6 +311,22 @@ class TaskEngine(
                 deadlineOnly = false
             }
         }
+        patch.recurrence?.let {
+            if (it != task.recurrence) {
+                updated = updated.copy(recurrence = it)
+                changes += if (it == Recurrence.NONE) "no longer repeats" else "repeats ${repeatWord(it)}"
+                deadlineOnly = false
+            }
+        }
+        patch.notes?.let {
+            val notes = cleanNotes(it)
+            if (notes != null && notes.length > Task.MAX_NOTES_LENGTH) return reject("Those notes are too long.")
+            if (notes != task.notes) {
+                updated = updated.copy(notes = notes)
+                changes += if (notes == null) "notes cleared" else "notes updated"
+                deadlineOnly = false
+            }
+        }
         if (patch.title != null && updated.title != task.title) deadlineOnly = false
 
         lastTaskId = task.id
@@ -222,6 +334,7 @@ class TaskEngine(
             return EngineResult(Outcome.OK, "${task.title} is already set that way.", taskIds = listOf(task.id))
         }
         store.update(updated)
+        undoAction = { store.update(task) }
 
         val spoken = when {
             deadlineOnly && patch.clearDeadline -> "Done. ${updated.title} no longer has a deadline."
@@ -247,8 +360,27 @@ class TaskEngine(
                 completedAt = if (done) clock.millis() else null
             )
         )
-        val spoken = if (done) "Done. I marked ${task.title} as done." else "Okay, ${task.title} is open again."
-        return EngineResult(Outcome.OK, spoken, taskIds = listOf(task.id))
+        undoAction = { store.update(task) }
+        if (!done) return EngineResult(Outcome.OK, "Okay, ${task.title} is open again.", taskIds = listOf(task.id))
+
+        var spoken = "Done. I marked ${task.title} as done."
+        val ids = mutableListOf(task.id)
+        if (task.recurrence != Recurrence.NONE) {
+            val next = store.insert(
+                task.copy(
+                    id = 0,
+                    deadline = nextDeadline(task),
+                    status = TaskStatus.OPEN,
+                    createdAt = clock.millis(),
+                    completedAt = null
+                )
+            )
+            ids += next.id
+            undoAction = { store.update(task); store.delete(next.id) }
+            spoken += next.deadline?.let { " The next one is due ${format.deadline(it)}." }
+                ?: " It will come back ${repeatWord(task.recurrence)}."
+        }
+        return EngineResult(Outcome.OK, spoken, taskIds = ids)
     }
 
     private fun delete(cmd: TaskCommand.DeleteTask): EngineResult {
@@ -258,6 +390,8 @@ class TaskEngine(
         }
         store.delete(task.id)
         if (lastTaskId == task.id) lastTaskId = null
+        // The store assigns a new id on re-insert; the task itself comes back unchanged.
+        undoAction = { lastTaskId = store.insert(task).id }
         return EngineResult(Outcome.OK, "Done. I deleted ${task.title}.", taskIds = listOf(task.id))
     }
 
@@ -376,5 +510,7 @@ class TaskEngine(
 
     private companion object {
         const val MAX_SPOKEN_ITEMS = 4
+        const val MAX_SNOOZE_MIN = 24 * 60
+        const val MAX_CATCH_UP = 400
     }
 }

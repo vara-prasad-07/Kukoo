@@ -6,11 +6,12 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.example.kukoo.domain.Priority
+import com.example.kukoo.domain.Recurrence
 import com.example.kukoo.domain.Task
 import com.example.kukoo.domain.TaskStatus
 import com.example.kukoo.domain.TaskStore
 
-/** Local SQLite persistence for tasks: title, deadline, duration, priority, status. */
+/** Local SQLite persistence for tasks: title, deadline, duration, priority, status, recurrence, notes. */
 class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_VERSION), TaskStore {
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -24,7 +25,9 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
                 $PRIORITY TEXT NOT NULL,
                 $STATUS TEXT NOT NULL,
                 $CREATED INTEGER NOT NULL,
-                $COMPLETED INTEGER
+                $COMPLETED INTEGER,
+                $RECURRENCE TEXT NOT NULL DEFAULT 'NONE',
+                $NOTES TEXT
             )
             """.trimIndent()
         )
@@ -32,7 +35,11 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Version 1 is the first schema; add migrations here rather than dropping user data.
+        // Migrations only ever add columns, so existing tasks are preserved.
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE $TABLE ADD COLUMN $RECURRENCE TEXT NOT NULL DEFAULT 'NONE'")
+            db.execSQL("ALTER TABLE $TABLE ADD COLUMN $NOTES TEXT")
+        }
     }
 
     override fun all(): List<Task> {
@@ -73,6 +80,8 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
         put(STATUS, status.name)
         put(CREATED, createdAt)
         put(COMPLETED, completedAt)
+        put(RECURRENCE, recurrence.name)
+        put(NOTES, notes)
     }
 
     private fun Cursor.toTask(): Task {
@@ -86,13 +95,15 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
             status = runCatching { TaskStatus.valueOf(getString(getColumnIndexOrThrow(STATUS))) }
                 .getOrDefault(TaskStatus.OPEN),
             createdAt = getLong(getColumnIndexOrThrow(CREATED)),
-            completedAt = longOrNull(COMPLETED)
+            completedAt = longOrNull(COMPLETED),
+            recurrence = Recurrence.fromName(getString(getColumnIndexOrThrow(RECURRENCE))),
+            notes = getColumnIndexOrThrow(NOTES).let { if (isNull(it)) null else getString(it) }
         )
     }
 
     private companion object {
         const val DB_NAME = "kukoo.db"
-        const val DB_VERSION = 1
+        const val DB_VERSION = 2
         const val TABLE = "tasks"
         const val ID = "id"
         const val TITLE = "title"
@@ -102,5 +113,7 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
         const val STATUS = "status"
         const val CREATED = "created_at"
         const val COMPLETED = "completed_at"
+        const val RECURRENCE = "recurrence"
+        const val NOTES = "notes"
     }
 }

@@ -33,7 +33,10 @@ import java.time.LocalDate
 class AppFlowTest {
     private val app get() = ApplicationProvider.getApplicationContext<KukooApp>()
 
-    private fun newVm(): KukooViewModel = KukooViewModel(app).also { vm ->
+    /** Every test runs at 3 PM on a fixed day, so "due today" / "tomorrow" never depend on the wall clock. */
+    private val clock = clockAt(15)
+
+    private fun newVm(): KukooViewModel = KukooViewModel(app.also { it.container = AppContainer(it, clock) }).also { vm ->
         await("seed data loaded") { vm.state.value.loaded && vm.state.value.tasks.size == 5 }
     }
 
@@ -116,8 +119,8 @@ class AppFlowTest {
         vm.say("Move the client deck to tomorrow")
         val deck = vm.task("Client Deck")
         assertEquals(
-            LocalDate.now().plusDays(1),
-            Instant.ofEpochMilli(deck.deadline!!).atZone(java.time.ZoneId.systemDefault()).toLocalDate()
+            LocalDate.now(clock).plusDays(1),
+            Instant.ofEpochMilli(deck.deadline!!).atZone(clock.zone).toLocalDate()
         )
         assertTrue(vm.state.value.session.turns.last().text.startsWith("Done. Client Deck is now due tomorrow at "))
 
@@ -211,7 +214,7 @@ class AppFlowTest {
 
         // A deadline in the past is refused and the editor stays open with the reason.
         vm.openEditor(null)
-        vm.saveEditor("Yesterday thing", System.currentTimeMillis() - 3_600_000, 30, Priority.MEDIUM)
+        vm.saveEditor("Yesterday thing", clock.millis() - 3_600_000, 30, Priority.MEDIUM)
         await("error shown") { vm.state.value.editor?.error != null }
         assertTrue(vm.state.value.editor!!.error!!.contains("already passed"))
         assertTrue(vm.state.value.tasks.none { it.title == "Yesterday thing" })
@@ -265,6 +268,39 @@ class AppFlowTest {
         vm.ringNow()
         vm.onAppBackgrounded()
         assertEquals(Screen.HOME, vm.state.value.screen)
+    }
+
+    @Test
+    fun quickActionChips_undoAndQuickTimePicker() {
+        val vm = newVm()
+        vm.startAndAwaitBriefing()
+        assertFalse(vm.state.value.canUndo)
+
+        vm.say("Add a task: water plants tomorrow at 5")
+        assertTrue(vm.state.value.canUndo)
+        val actions = vm.state.value.session.quickActions
+        assertEquals(listOf("+1 Hour", "Tomorrow 9 AM", "Snooze 15m"), actions.map { it.label })
+
+        // A chip is just a typed command: "Tomorrow 9 AM" moves the task that was just added.
+        vm.say(actions.first { it.label == "Tomorrow 9 AM" }.text)
+        assertEquals(millis(TOMORROW, 9), vm.task("Water plants").deadline)
+
+        vm.say(vm.state.value.session.quickActions.first { it.label == "+1 Hour" }.text)
+        assertEquals(millis(TOMORROW, 10), vm.task("Water plants").deadline)
+
+        // The snackbar's Undo runs the Undo command and reports it in the call.
+        vm.executeCommand(com.example.kukoo.domain.TaskCommand.Undo)
+        await("undo applied") { vm.state.value.session.turns.last().text == "Undid last action." }
+        assertEquals(millis(TOMORROW, 9), vm.task("Water plants").deadline)
+        assertFalse(vm.state.value.canUndo)
+    }
+
+    @Test
+    fun quickTimePicker_changesOnlyTheTime() {
+        val vm = newVm()
+        val followUp = vm.task("Follow-up") // seeded 40 minutes after 3 PM
+        vm.setTaskTime(followUp, 18, 0)
+        await("time changed") { vm.task("Follow-up").deadline == millis(TODAY, 18) && vm.state.value.canUndo }
     }
 }
 

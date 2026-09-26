@@ -39,10 +39,14 @@ data class TaskPatch(
     val deadline: DeadlineSpec? = null,
     val clearDeadline: Boolean = false,
     val durationMin: Int? = null,
-    val priority: Priority? = null
+    val priority: Priority? = null,
+    val recurrence: Recurrence? = null,
+    /** Blank clears the notes. */
+    val notes: String? = null
 ) {
     val isEmpty: Boolean
-        get() = title == null && deadline == null && !clearDeadline && durationMin == null && priority == null
+        get() = title == null && deadline == null && !clearDeadline && durationMin == null && priority == null &&
+            recurrence == null && notes == null
 }
 
 enum class QueryScope { TODAY, ALL_OPEN }
@@ -63,7 +67,9 @@ sealed interface TaskCommand {
         val title: String,
         val deadline: DeadlineSpec? = null,
         val durationMin: Int? = null,
-        val priority: Priority? = null
+        val priority: Priority? = null,
+        val recurrence: Recurrence = Recurrence.NONE,
+        val notes: String? = null
     ) : TaskCommand
 
     data class UpdateTask(val ref: TaskRef, val patch: TaskPatch) : TaskCommand
@@ -71,7 +77,13 @@ sealed interface TaskCommand {
     data class ReopenTask(val ref: TaskRef) : TaskCommand
     data class DeleteTask(val ref: TaskRef) : TaskCommand
     data class Replan(val scope: PlanScope) : TaskCommand
+    /** Pushes every overdue and due-today open task back by [minutes]. */
+    data class Snooze(val minutes: Int = 15) : TaskCommand
+
     data object EndCall : TaskCommand
+
+    /** Reverts the most recent change made by add / update / complete / reopen / delete. */
+    data object Undo : TaskCommand
 
     /** The utterance did not map to a supported command. */
     data class Unsupported(val heard: String) : TaskCommand

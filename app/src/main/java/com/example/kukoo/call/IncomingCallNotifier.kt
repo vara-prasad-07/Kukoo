@@ -21,14 +21,32 @@ import com.example.kukoo.MainActivity
 object IncomingCallNotifier {
     const val ACTION_INCOMING_CALL = "com.example.kukoo.action.INCOMING_CALL"
     private const val CHANNEL_ID = "incoming_call"
-    private const val NOTIFICATION_ID = 1001
-    private const val RING_TIMEOUT_MS = 30_000L
+    private const val SESSION_CHANNEL_ID = "call_session"
+    const val NOTIFICATION_ID = 1001
+    const val SESSION_NOTIFICATION_ID = 1002
+    const val RING_TIMEOUT_MS = 30_000L
 
     /** Returns false when notifications are not allowed, so nothing could be shown. */
     @SuppressLint("MissingPermission")
     fun show(context: Context): Boolean {
         val app = context.applicationContext
         if (!canNotify(app)) return false
+        // Preferred: a foreground service whose notification is this call (keeps the process alive on
+        // aggressive OEMs). If the system won't start it, post the notification directly.
+        if (!CallForegroundService.startRinging(app)) notifyRinging(app)
+        return true
+    }
+
+    /** Posts the ringing notification without a service. */
+    @SuppressLint("MissingPermission")
+    fun notifyRinging(context: Context) {
+        val app = context.applicationContext
+        if (!canNotify(app)) return
+        NotificationManagerCompat.from(app).notify(NOTIFICATION_ID, buildRingingNotification(app))
+    }
+
+    fun buildRingingNotification(context: Context): android.app.Notification {
+        val app = context.applicationContext
         ensureChannel(app)
 
         val launch = PendingIntent.getActivity(
@@ -50,11 +68,32 @@ object IncomingCallNotifier {
             .setContentIntent(launch)
             .setFullScreenIntent(launch, true)
             .build()
-        NotificationManagerCompat.from(app).notify(NOTIFICATION_ID, notification)
-        return true
+        return notification
+    }
+
+    /** Quiet ongoing notification shown while a voice session is running. */
+    fun buildSessionNotification(context: Context): android.app.Notification {
+        val app = context.applicationContext
+        ensureChannel(app)
+        val open = PendingIntent.getActivity(
+            app, 1,
+            Intent(app, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        return NotificationCompat.Builder(app, SESSION_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.sym_action_call)
+            .setContentTitle("Your Tasks")
+            .setContentText("Call in progress")
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setContentIntent(open)
+            .build()
     }
 
     fun cancel(context: Context) {
+        CallForegroundService.stop(context)
         NotificationManagerCompat.from(context).cancel(NOTIFICATION_ID)
     }
 
@@ -79,6 +118,13 @@ object IncomingCallNotifier {
             enableVibration(false)
             lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
         }
-        context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val manager = context.getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(channel)
+        manager.createNotificationChannel(
+            NotificationChannel(SESSION_CHANNEL_ID, "Call in progress", NotificationManager.IMPORTANCE_LOW).apply {
+                description = "Shown while a voice call with Your Tasks is running"
+                setSound(null, null)
+            }
+        )
     }
 }

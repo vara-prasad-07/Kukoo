@@ -25,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.Checklist
+import androidx.compose.material.icons.filled.Snooze
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -43,7 +44,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import com.example.kukoo.call.CallRinger
 import com.example.kukoo.domain.TimeFormat
 import com.example.kukoo.ui.common.LightSystemBarIcons
 import com.example.kukoo.ui.theme.CallAnswer
@@ -62,16 +62,12 @@ fun IncomingCallScreen(
     clock: Clock,
     format: TimeFormat,
     onAnswer: () -> Unit,
-    onDecline: () -> Unit
+    onDecline: () -> Unit,
+    onSnooze: () -> Unit = {}
 ) {
     LightSystemBarIcons()
 
-    val context = LocalContext.current
-    val ringer = remember { CallRinger(context) }
-    DisposableEffect(Unit) {
-        ringer.start()
-        onDispose { ringer.stop() }
-    }
+    // The ViewModel owns the ringer (it survives rotation and stops before the session starts).
     // Unanswered calls end as a missed call.
     LaunchedEffect(Unit) {
         delay(RING_TIMEOUT_MS)
@@ -119,6 +115,7 @@ fun IncomingCallScreen(
                 horizontalArrangement = Arrangement.SpaceEvenly
             ) {
                 CallButton(CallDecline, Icons.Default.CallEnd, "Decline", onDecline)
+                CallButton(Indigo40, Icons.Default.Snooze, "Snooze 15m", onSnooze)
                 CallButton(CallAnswer, Icons.Default.Call, "Answer", onAnswer)
             }
         }

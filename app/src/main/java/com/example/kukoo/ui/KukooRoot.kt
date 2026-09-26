@@ -18,6 +18,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.net.toUri
 import com.example.kukoo.domain.PlanScope
+import com.example.kukoo.domain.TaskCommand
 import com.example.kukoo.ui.call.IncomingCallScreen
 import com.example.kukoo.ui.home.DailyCallDialog
 import com.example.kukoo.ui.home.HomeScreen
@@ -61,14 +62,18 @@ fun KukooRoot(vm: KukooViewModel) {
                 },
                 onDailyCall = { showDailyDialog = true },
                 onResetDemo = vm::resetDemoData,
-                onNoticeShown = vm::dismissNotice
+                onNoticeShown = vm::dismissNotice,
+                events = vm.events,
+                onUndo = { vm.executeCommand(TaskCommand.Undo) },
+                onSetTime = vm::setTaskTime
             )
 
             Screen.INCOMING_CALL -> IncomingCallScreen(
                 clock = vm.clock,
                 format = vm.format,
                 onAnswer = vm::answerCall,
-                onDecline = vm::declineCall
+                onDecline = vm::declineCall,
+                onSnooze = vm::snoozeCall
             )
 
             Screen.SESSION -> VoiceSessionScreen(
@@ -77,7 +82,10 @@ fun KukooRoot(vm: KukooViewModel) {
                 onSend = vm::submitText,
                 onMicPress = vm::onMicPress,
                 onMicRelease = vm::onMicRelease,
-                onEnd = vm::endCall
+                onEnd = vm::endCall,
+                canUndo = state.canUndo,
+                events = vm.events,
+                onUndo = { vm.executeCommand(TaskCommand.Undo) }
             )
 
             Screen.PLAN -> state.plan?.let { plan ->
@@ -97,7 +105,9 @@ fun KukooRoot(vm: KukooViewModel) {
                 editor = editor,
                 format = vm.format,
                 clock = vm.clock,
-                onSave = vm::saveEditor,
+                onSave = { title, deadline, duration, priority, notes, recurrence ->
+                    vm.saveEditor(title, deadline, duration, priority, notes, recurrence)
+                },
                 onDismiss = vm::closeEditor
             )
         }

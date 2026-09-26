@@ -13,7 +13,8 @@ import java.time.LocalDateTime
 import java.time.LocalTime
 
 /**
- * Schedules the "Your Tasks" call with [AlarmManager.setAlarmClock]: exact, and it fires in Doze.
+ * Schedules the "Your Tasks" call with [AlarmManager.setAlarmClock]: exact, fires in Doze and is exempt from
+ * background-start limits. [AlarmManager.setExactAndAllowWhileIdle] is the exact fallback if that is refused.
  * Needs the exact-alarm permission on Android 12+ (declared in the manifest; USE_EXACT_ALARM is
  * granted automatically on 13+). If it is ever missing we fall back to an inexact alarm.
  * Trade-off: Android shows an alarm icon while one is pending.
@@ -76,6 +77,12 @@ class CallScheduler(context: Context, private val clock: Clock) {
                 return
             } catch (_: SecurityException) {
                 // Permission revoked between the check and the call: fall through to the inexact alarm.
+            }
+            try {
+                alarms.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, atMillis, operation)
+                return
+            } catch (_: SecurityException) {
+                // Still no exact access: use the inexact alarm below.
             }
         }
         // Without exact-alarm access the call may be a few minutes late, but it still rings.

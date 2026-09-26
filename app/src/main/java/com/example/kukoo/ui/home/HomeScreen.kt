@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -66,6 +67,13 @@ import com.example.kukoo.ui.theme.Danger
 import com.example.kukoo.ui.theme.Success
 import com.example.kukoo.ui.theme.color
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.emptyFlow
+import androidx.compose.material3.SnackbarResult
+import androidx.compose.ui.platform.LocalContext
+import com.example.kukoo.ui.UiEvent
+import java.time.LocalTime
 import java.time.Clock
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
@@ -88,12 +96,26 @@ fun HomeScreen(
     onRingIn: () -> Unit,
     onDailyCall: () -> Unit,
     onResetDemo: () -> Unit,
-    onNoticeShown: () -> Unit
+    onNoticeShown: () -> Unit,
+    events: Flow<UiEvent> = emptyFlow(),
+    onUndo: () -> Unit = {},
+    onSetTime: (Task, Int, Int) -> Unit = { _, _, _ -> }
 ) {
     val snackbar = remember { SnackbarHostState() }
+    // Messages already offered with an Undo button, so the plain notice for the same change isn't shown twice.
+    val undoOffered = remember { mutableSetOf<String>() }
+    LaunchedEffect(events) {
+        events.collectLatest { event ->
+            if (event is UiEvent.ShowUndoSnackbar) {
+                undoOffered += event.message
+                val result = snackbar.showSnackbar(event.message, actionLabel = "Undo", withDismissAction = true)
+                if (result == SnackbarResult.ActionPerformed) onUndo()
+            }
+        }
+    }
     LaunchedEffect(state.notice) {
         state.notice?.let {
-            snackbar.showSnackbar(it)
+            if (!undoOffered.remove(it)) snackbar.showSnackbar(it)
             onNoticeShown()
         }
     }
@@ -189,9 +211,11 @@ fun HomeScreen(
                         task = task,
                         format = format,
                         now = now,
+                        zone = clock.zone,
                         onClick = { onEdit(task) },
                         onToggleDone = { onToggleDone(task) },
-                        onDelete = { onDelete(task) }
+                        onDelete = { onDelete(task) },
+                        onSetTime = { h, m -> onSetTime(task, h, m) }
                     )
                 }
             }
@@ -308,11 +332,14 @@ private fun TaskRow(
     task: Task,
     format: TimeFormat,
     now: Long,
+    zone: java.time.ZoneId,
     onClick: () -> Unit,
     onToggleDone: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onSetTime: (hour: Int, minute: Int) -> Unit
 ) {
     var menu by remember { mutableStateOf(false) }
+    val context = LocalContext.current
     val deadline = task.deadline
     val isOverdue = !task.isDone && deadline != null && deadline < now
 
@@ -348,11 +375,34 @@ private fun TaskRow(
                 )
                 Spacer(Modifier.height(2.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    // Tapping the time opens the native time picker: change it without the full editor.
+                    val timeTap = if (task.isDone) Modifier else Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable(onClickLabel = "Change time") {
+                            val start = deadline?.let { java.time.Instant.ofEpochMilli(it).atZone(zone).toLocalTime() }
+                                ?: LocalTime.of(18, 0)
+                            android.app.TimePickerDialog(
+                                context,
+                                { _, h, m -> onSetTime(h, m) },
+                                start.hour, start.minute, false
+                            ).show()
+                        }
+                    Row(modifier = timeTap, verticalAlignment = Alignment.CenterVertically) {
+                        if (!task.isDone) {
+                            Icon(
+                                Icons.Default.Schedule,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp),
+                                tint = if (isOverdue) Danger else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.width(4.dp))
+                        }
                     Text(
                         text = deadlineLabel(task, format),
                         style = MaterialTheme.typography.bodySmall,
                         color = if (isOverdue) Danger else MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    }
                     Text(
                         text = "  ·  ${shortDuration(task.durationMin)}",
                         style = MaterialTheme.typography.bodySmall,

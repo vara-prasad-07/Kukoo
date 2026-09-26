@@ -6,6 +6,7 @@ import com.example.kukoo.domain.DeadlineSpec
 import com.example.kukoo.domain.PlanScope
 import com.example.kukoo.domain.Priority
 import com.example.kukoo.domain.QueryScope
+import com.example.kukoo.domain.Recurrence
 import com.example.kukoo.domain.TaskCommand
 import com.example.kukoo.domain.TaskPatch
 import com.example.kukoo.domain.TaskRef
@@ -22,6 +23,33 @@ class RuleBasedIntentParserTest {
         DeadlineSpec.Relative(day, h?.let { LocalTime.of(it, m) })
 
     // The seven commands from the implementation document, verbatim.
+
+    @Test fun undoPhrases() {
+        listOf("undo", "undo that", "Cancel that", "revert", "please undo it").forEach {
+            assertEquals(it, TaskCommand.Undo, parse(it))
+        }
+    }
+
+    @Test fun snoozePhrases() {
+        assertEquals(TaskCommand.Snooze(15), parse("snooze"))
+        assertEquals(TaskCommand.Snooze(15), parse("snooze 15 minutes"))
+        assertEquals(TaskCommand.Snooze(30), parse("snooze for 30 minutes"))
+        assertEquals(TaskCommand.Snooze(60), parse("remind me in 1 hour"))
+        assertEquals(TaskCommand.Snooze(60), parse("remind me in an hour"))
+    }
+
+    @Test fun recurrenceKeywordsOnAdd() {
+        fun rec(s: String) = (parse(s) as TaskCommand.AddTask).recurrence
+        assertEquals(Recurrence.DAILY, rec("add task water plants every day"))
+        assertEquals(Recurrence.DAILY, rec("add a daily standup at 9 am"))
+        assertEquals(Recurrence.WEEKDAYS, rec("add task send report every weekday at 5 pm"))
+        assertEquals(Recurrence.WEEKLY, rec("add task team sync every week"))
+        assertEquals("Water plants", (parse("add task water plants every day") as TaskCommand.AddTask).title.replaceFirstChar { it.uppercase() })
+        assertEquals(Recurrence.NONE, rec("add task buy milk tomorrow"))
+    }
+
+    @Test fun cancelATask_isStillDelete() =
+        assertEquals(TaskCommand.DeleteTask(TaskRef.ByTitle("expense report")), parse("cancel the expense report"))
 
     @Test fun whatsDueToday() =
         assertEquals(TaskCommand.QueryTasks(QueryScope.TODAY), parse("What's due today?"))

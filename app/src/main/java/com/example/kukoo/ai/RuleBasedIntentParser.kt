@@ -5,6 +5,7 @@ import com.example.kukoo.domain.DeadlineSpec
 import com.example.kukoo.domain.PlanScope
 import com.example.kukoo.domain.Priority
 import com.example.kukoo.domain.QueryScope
+import com.example.kukoo.domain.Recurrence
 import com.example.kukoo.domain.TaskCommand
 import com.example.kukoo.domain.TaskPatch
 import com.example.kukoo.domain.TaskRef
@@ -26,6 +27,17 @@ class RuleBasedIntentParser : IntentParser {
         if (t.isEmpty()) return TaskCommand.Unsupported(utterance)
 
         if (endCall.matches(t)) return TaskCommand.EndCall
+        // Before "cancel <task>" (delete) so that "cancel that" means undo.
+        if (undo.matches(t)) return TaskCommand.Undo
+
+        snooze.matchEntire(t)?.let { m ->
+            val tail = m.groupValues[1].trim()
+            return if (tail.isEmpty()) TaskCommand.Snooze() else snoozeMinutes(tail)?.let { TaskCommand.Snooze(it) }
+                ?: TaskCommand.Unsupported(utterance)
+        }
+        remindIn.matchEntire(t)?.let { m ->
+            snoozeMinutes(m.groupValues[1])?.let { return TaskCommand.Snooze(it) }
+        }
 
         replan.matchEntire(t)?.let { m ->
             val scope = if (m.groupValues[1] == "afternoon") PlanScope.AFTERNOON else PlanScope.DAY
@@ -79,14 +91,38 @@ class RuleBasedIntentParser : IntentParser {
             val scope = if (allScope.containsMatchIn(t)) QueryScope.ALL_OPEN else QueryScope.TODAY
             return TaskCommand.QueryTasks(scope)
         }
+        implicitAdd(t, utterance)?.let { return it }
         return TaskCommand.Unsupported(utterance)
+    }
+
+    /**
+     * "gym every day at 12pm", "read book at 9pm": a phrase with a time (or a repeat) and no command
+     * word is a new task, even without "add". Anything that sounds like finishing, removing or
+     * asking is left alone.
+     */
+    private fun implicitAdd(t: String, heard: String): TaskCommand? {
+        if (implicitBlockers.containsMatchIn(t) || questionStart.containsMatchIn(t)) return null
+        val hasRepeat = recurrenceRe.containsMatchIn(" $t ")
+        val hasTime = extractWhen(t).spec?.time != null
+        if (!hasTime && !hasRepeat) return null
+        return buildAdd(t, heard).takeIf { it is TaskCommand.AddTask }
     }
 
     private fun buildAdd(body: String, heard: String): TaskCommand {
         var rest = " $body "
         var minutes: Int? = null
         var priority: Priority? = null
+        var recurrence = Recurrence.NONE
 
+        recurrenceRe.find(rest)?.let { m ->
+            recurrence = when (m.groupValues[1]) {
+                "every day", "everyday", "daily", "each day" -> Recurrence.DAILY
+                "every weekday", "weekdays" -> Recurrence.WEEKDAYS
+                "every week", "weekly", "each week" -> Recurrence.WEEKLY
+                else -> Recurrence.MONTHLY
+            }
+            rest = rest.replaceRange(m.range, " ")
+        }
         durationPrefixed.find(rest)?.let { m ->
             durationFrom(m)?.let {
                 minutes = it
@@ -104,7 +140,7 @@ class RuleBasedIntentParser : IntentParser {
         val extracted = extractWhen(rest.trim())
         val title = cleanTitle(extracted.rest)
         if (title.isEmpty()) return TaskCommand.Unsupported(heard)
-        return TaskCommand.AddTask(title, extracted.spec, minutes, priority)
+        return TaskCommand.AddTask(title, extracted.spec, minutes, priority, recurrence)
     }
 
     // ---- time phrases --------------------------------------------------------------------
@@ -192,6 +228,12 @@ class RuleBasedIntentParser : IntentParser {
         return minutes.takeIf { it > 0 }
     }
 
+    /** "15 minutes", "an hour", or a bare "20"; null when [text] is not a duration. */
+    private fun snoozeMinutes(text: String): Int? {
+        val t = text.trim().removePrefix("for ").removePrefix("by ").trim()
+        return (t.toIntOrNull() ?: parseBareDuration(t))?.takeIf { it > 0 }
+    }
+
     private fun parseBareDuration(text: String): Int? =
         durationBare.find(text.trim())?.let(::durationFrom)
 
@@ -235,6 +277,20 @@ class RuleBasedIntentParser : IntentParser {
         val endCall = Regex(
             "(?:please )?(?:end (?:the )?call|hang up|good ?bye|bye|that'?s all|that is all|i'?m done|we'?re done|" +
                 "no thanks?|nothing else|stop)"
+        )
+        val undo = Regex(
+            "(?:please )?(?:undo(?: (?:that|it|the last (?:thing|action|change)|last action))?|" +
+                "cancel that|revert(?: (?:that|it|the last (?:thing|action|change)))?)"
+        )
+        val snooze = Regex("(?:please )?snooze(?: (.+))?")
+        val remindIn = Regex("(?:please )?remind me in\\s+(.+)")
+        val implicitBlockers = Regex(
+            "\\b(?:done|complete|completed|finish|finished|delete|remove|undo|revert|cancel|snooze|" +
+                "replan|reschedule|move|change|set|mark|reopen|not)\\b"
+        )
+        val questionStart = Regex("^(?:what|whats|what's|when|where|why|how|who|is|are|do|does|did|can|could|will|would)\\b")
+        val recurrenceRe = Regex(
+            "\\s(every day|everyday|each day|daily|every weekday|weekdays|every week|each week|weekly|every month|monthly)(?=\\s)"
         )
         val replan = Regex(
             "(?:please )?(?:(?:can|could) you )?(?:re-?plan|re-?schedule|plan|organi[sz]e)\\s+(?:my|the)\\s+" +

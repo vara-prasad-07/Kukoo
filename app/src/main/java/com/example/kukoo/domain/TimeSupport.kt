@@ -27,8 +27,37 @@ class DeadlineResolver(private val clock: Clock, private val config: PlannerConf
                 is DayRef.Weekday -> nextWeekday(day.day)
             }
             val time = spec.time ?: current?.toLocalTime() ?: LocalTime.of(config.defaultDeadlineHour, 0)
-            LocalDateTime.of(date, time).atZone(zone).toInstant().toEpochMilli()
+            var target = LocalDateTime.of(date, time)
+            // Invariant: a relative deadline is never in the past. If the moment has already gone by
+            // (today's 10 AM at 3 PM), it rolls to the same time on the next day. Only an explicit
+            // DeadlineSpec.Exact can name a past moment.
+            var guard = 0
+            while (target.atZone(zone).toInstant().toEpochMilli() < clock.millis() && guard++ < MAX_ROLLOVER_DAYS) {
+                target = target.plusDays(1)
+            }
+            target.atZone(zone).toInstant().toEpochMilli()
         }
+    }
+
+    /** The next due time after [deadline] for a repeating task: same time of day, later date. */
+    fun nextOccurrence(deadline: Long, recurrence: Recurrence): Long {
+        val current = toLocal(deadline)
+        val next = when (recurrence) {
+            Recurrence.NONE -> current
+            Recurrence.DAILY -> current.plusDays(1)
+            Recurrence.WEEKDAYS -> {
+                var d = current.plusDays(1)
+                while (d.dayOfWeek == DayOfWeek.SATURDAY || d.dayOfWeek == DayOfWeek.SUNDAY) d = d.plusDays(1)
+                d
+            }
+            Recurrence.WEEKLY -> current.plusWeeks(1)
+            Recurrence.MONTHLY -> current.plusMonths(1)
+        }
+        return next.atZone(zone).toInstant().toEpochMilli()
+    }
+
+    private companion object {
+        const val MAX_ROLLOVER_DAYS = 3660
     }
 
     private fun nextWeekday(target: DayOfWeek): LocalDate {

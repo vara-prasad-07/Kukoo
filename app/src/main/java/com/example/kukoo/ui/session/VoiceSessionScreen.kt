@@ -35,6 +35,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -69,6 +72,10 @@ import com.example.kukoo.ui.theme.CallDecline
 import com.example.kukoo.ui.theme.Indigo40
 import com.example.kukoo.ui.theme.PriorityMedium
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.emptyFlow
+import com.example.kukoo.ui.UiEvent
 import java.time.Clock
 
 /** The supported commands. Tapping one sends it, so the demo works even if the microphone does not. */
@@ -82,6 +89,28 @@ private val SUGGESTIONS = listOf(
     "Replan my afternoon"
 )
 
+private val UndoAmber = Color(0xFFFFB74D)
+
+@Composable
+private fun ActionChip(label: String, accent: Color?, enabled: Boolean, onClick: () -> Unit) {
+    val base = accent ?: Color.White
+    Surface(
+        shape = CircleShape,
+        color = base.copy(alpha = if (accent != null) 0.22f else 0.16f),
+        border = BorderStroke(1.dp, base.copy(alpha = 0.6f)),
+        modifier = Modifier
+            .clip(CircleShape)
+            .clickable(enabled = enabled, onClick = onClick)
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelLarge,
+            color = base.copy(alpha = if (enabled) 1f else 0.5f),
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+        )
+    }
+}
+
 /** Screen 3 of 4: the voice conversation with turn-based tap-to-talk. */
 @Composable
 fun VoiceSessionScreen(
@@ -90,9 +119,22 @@ fun VoiceSessionScreen(
     onSend: (String) -> Unit,
     onMicPress: () -> Unit,
     onMicRelease: () -> Unit,
-    onEnd: () -> Unit
+    onEnd: () -> Unit,
+    canUndo: Boolean = false,
+    events: Flow<UiEvent> = emptyFlow(),
+    onUndo: () -> Unit = {}
 ) {
     LightSystemBarIcons()
+
+    val snackbar = remember { SnackbarHostState() }
+    LaunchedEffect(events) {
+        events.collectLatest { event ->
+            if (event is UiEvent.ShowUndoSnackbar) {
+                val result = snackbar.showSnackbar(event.message, actionLabel = "Undo", withDismissAction = true)
+                if (result == SnackbarResult.ActionPerformed) onUndo()
+            }
+        }
+    }
 
     var elapsedSeconds by remember { mutableLongStateOf(0L) }
     LaunchedEffect(session.startedAt) {
@@ -146,6 +188,26 @@ fun VoiceSessionScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             items(session.turns, key = { it.id }) { TurnBubble(it) }
+        }
+
+        SnackbarHost(snackbar, modifier = Modifier.padding(horizontal = 8.dp))
+
+        // Context chips first: Undo when there is something to undo, then adjustments for the last task.
+        if (canUndo || session.quickActions.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (canUndo) {
+                    ActionChip("Undo", accent = UndoAmber, enabled = canSend) { onSend("undo") }
+                }
+                session.quickActions.forEach { action ->
+                    ActionChip(action.label, accent = null, enabled = canSend) { onSend(action.text) }
+                }
+            }
         }
 
         Row(

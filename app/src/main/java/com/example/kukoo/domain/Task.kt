@@ -13,6 +13,20 @@ enum class Priority(val label: String, val rank: Int) {
 
 enum class TaskStatus { OPEN, DONE }
 
+/** How often a task comes back after it is completed. */
+enum class Recurrence(val label: String) {
+    NONE("Never"),
+    DAILY("Daily"),
+    WEEKDAYS("Weekdays"),
+    WEEKLY("Weekly"),
+    MONTHLY("Monthly");
+
+    companion object {
+        fun fromName(name: String?): Recurrence =
+            entries.firstOrNull { it.name.equals(name, ignoreCase = true) } ?: NONE
+    }
+}
+
 /**
  * A task as described in the implementation document:
  * title, deadline, duration, priority, status.
@@ -26,7 +40,9 @@ data class Task(
     val priority: Priority = Priority.MEDIUM,
     val status: TaskStatus = TaskStatus.OPEN,
     val createdAt: Long,
-    val completedAt: Long? = null
+    val completedAt: Long? = null,
+    val recurrence: Recurrence = Recurrence.NONE,
+    val notes: String? = null
 ) {
     val isDone: Boolean get() = status == TaskStatus.DONE
 
@@ -35,6 +51,7 @@ data class Task(
         const val MIN_DURATION_MIN = 5
         const val MAX_DURATION_MIN = 480
         const val MAX_TITLE_LENGTH = 120
+        const val MAX_NOTES_LENGTH = 500
     }
 }
 

@@ -26,30 +26,77 @@ class TaskEngine(
     /** Reverses the last successful mutation. Single step; cleared when a session starts or ends. */
     private var undoAction: (() -> Unit)? = null
 
+    /** The new task being set up by voice, or null. Only ever changed while holding [mutex]. */
+    @Volatile
+    private var draft: TaskDraft? = null
+
+    /**
+     * What is known about the task being set up, so a parser can read a short answer ("an hour",
+     * "high") in the context of the question that was just asked.
+     */
+    val pendingDraft: TaskDraft? get() = draft
+
     fun resetContext() {
         lastTaskId = null
         undoAction = null
+        draft = null
     }
 
     fun tasks(): List<Task> = store.all()
 
-    suspend fun execute(command: TaskCommand): EngineResult = mutex.withLock {
-        when (command) {
-            is TaskCommand.QueryTasks -> query(command.scope)
-            is TaskCommand.AddTask -> add(command)
-            is TaskCommand.UpdateTask -> update(command)
-            is TaskCommand.CompleteTask -> setDone(command.ref, done = true)
-            is TaskCommand.ReopenTask -> setDone(command.ref, done = false)
-            is TaskCommand.DeleteTask -> delete(command)
-            is TaskCommand.Replan -> replan(command.scope)
-            TaskCommand.Undo -> undo()
-            is TaskCommand.Snooze -> snooze(command.minutes)
-            TaskCommand.EndCall -> EngineResult(Outcome.END_CALL, "Okay, goodbye. Your tasks are up to date.")
-            is TaskCommand.Unsupported -> EngineResult(
-                Outcome.UNSUPPORTED,
-                "Sorry, I didn't catch a task command. You can ask what's due today, add, move, " +
-                    "finish or delete a task, or say replan my afternoon."
-            )
+    /**
+     * Runs one command exactly as given. Forms and the UI use this: an [TaskCommand.AddTask] here is
+     * added immediately, with defaults for whatever it leaves out.
+     */
+    suspend fun execute(command: TaskCommand): EngineResult = mutex.withLock { dispatch(command) }
+
+    /**
+     * Runs a command that came from what the user said or typed. Unlike [execute], adding a task
+     * this way needs a name, a deadline, a duration and a priority: anything missing is asked for,
+     * one detail at a time, and the task is only added once all four are known.
+     */
+    suspend fun executeSpoken(command: TaskCommand): EngineResult = mutex.withLock { dispatchSpoken(command) }
+
+    private suspend fun dispatch(command: TaskCommand): EngineResult = when (command) {
+        is TaskCommand.QueryTasks -> query(command.scope)
+        is TaskCommand.AddTask -> add(command)
+        is TaskCommand.StartTask -> startDraft(command.draft)
+        is TaskCommand.FillTask -> fillDraft(command.draft)
+        TaskCommand.DiscardDraft -> discardDraft()
+        is TaskCommand.UpdateTask -> update(command)
+        is TaskCommand.CompleteTask -> setDone(command.ref, done = true)
+        is TaskCommand.ReopenTask -> setDone(command.ref, done = false)
+        is TaskCommand.DeleteTask -> delete(command)
+        is TaskCommand.Replan -> replan(command.scope)
+        TaskCommand.Undo -> undo()
+        is TaskCommand.Snooze -> snooze(command.minutes)
+        TaskCommand.EndCall -> EngineResult(Outcome.END_CALL, "Okay, goodbye. Your tasks are up to date.")
+        is TaskCommand.Unsupported -> EngineResult(
+            Outcome.UNSUPPORTED,
+            "Sorry, I didn't catch a task command. You can ask what's due today, add, move, " +
+                "finish or delete a task, or say replan my afternoon."
+        )
+    }
+
+    private suspend fun dispatchSpoken(command: TaskCommand): EngineResult {
+        val pending = draft
+        return when (command) {
+            is TaskCommand.AddTask -> startDraft(TaskDraft.of(command))
+            // A misheard "gym every day at 12pm" is still a new task, and needs the same questions.
+            is TaskCommand.UpdateTask ->
+                selfHealToAdd(command)?.let { startDraft(TaskDraft.of(it)) } ?: withDraftReminder(command)
+            is TaskCommand.StartTask, is TaskCommand.FillTask, TaskCommand.DiscardDraft -> dispatch(command)
+            is TaskCommand.Unsupported ->
+                if (pending != null) ask(pending, prefix = "Sorry, I didn't catch that. ") else dispatch(command)
+            TaskCommand.EndCall -> {
+                if (pending == null) return dispatch(command)
+                draft = null
+                EngineResult(
+                    Outcome.END_CALL,
+                    "Okay, goodbye. I didn't add ${pending.title ?: "the new task"} because it wasn't finished."
+                )
+            }
+            else -> withDraftReminder(command)
         }
     }
 
@@ -200,6 +247,133 @@ class TaskEngine(
         undoAction = null
         action()
         return EngineResult(Outcome.OK, "Undid last action.")
+    }
+
+    // ---- adding a task by conversation ---------------------------------------------------
+
+    /** What one turn taught us: the updated draft, what to read back, and what was refused. */
+    private class Absorbed(val draft: TaskDraft, val heard: List<String>, val problems: List<String>)
+
+    /**
+     * Folds [incoming] into [base], checking each new detail on its own so a bad one is refused
+     * right away ("that time has passed") and asked for again, instead of failing at the very end.
+     */
+    private fun absorb(base: TaskDraft, incoming: TaskDraft): Absorbed {
+        var d = base
+        val heard = mutableListOf<String>()
+        val problems = mutableListOf<String>()
+        val now = clock.millis()
+
+        incoming.title?.let { raw ->
+            val title = cleanTitle(raw)
+            when {
+                title.isEmpty() -> Unit
+                title.length > Task.MAX_TITLE_LENGTH -> problems += "That task name is too long."
+                else -> { d = d.copy(title = title); heard += title }
+            }
+        }
+        incoming.deadline?.let { spec ->
+            val at = resolver.resolve(spec, existing = null)
+            if (at < now) problems += "${format.deadline(at).replaceFirstChar { it.uppercase() }} has already passed."
+            else { d = d.copy(deadline = spec); heard += "due ${format.deadline(at)}" }
+        }
+        incoming.durationMin?.let { minutes ->
+            val error = durationError(minutes)
+            if (error != null) problems += error
+            else { d = d.copy(durationMin = minutes); heard += format.duration(minutes) }
+        }
+        incoming.priority?.let { d = d.copy(priority = it); heard += "${it.label.lowercase()} priority" }
+        if (incoming.recurrence != Recurrence.NONE) {
+            d = d.copy(recurrence = incoming.recurrence)
+            heard += "repeats ${repeatWord(incoming.recurrence)}"
+        }
+        cleanNotes(incoming.notes)?.let { notes ->
+            if (notes.length > Task.MAX_NOTES_LENGTH) problems += "Those notes are too long."
+            else d = d.copy(notes = notes)
+        }
+        return Absorbed(d, heard, problems)
+    }
+
+    /** "Add ..." from the user: a new task, unless it is really the name they were just asked for. */
+    private fun startDraft(incoming: TaskDraft): EngineResult {
+        val pending = draft
+        val incomingTitle = incoming.title?.let(::cleanTitle)
+        // While the assistant is waiting for a name, whatever names a task completes that draft.
+        val continuing = pending != null &&
+            (pending.title == null || pending.title.equals(incomingTitle, ignoreCase = true))
+        val base = if (continuing) pending!! else TaskDraft()
+        val dropped = if (pending != null && !continuing && pending.title != null) {
+            "Dropping the unfinished ${pending.title}. "
+        } else ""
+        return progress(base, incoming, prefix = dropped, apologizeIfNothingNew = false)
+    }
+
+    /** The user's reply to a question. With no task in progress it simply starts one. */
+    private fun fillDraft(incoming: TaskDraft): EngineResult =
+        progress(draft ?: TaskDraft(), incoming, prefix = "", apologizeIfNothingNew = true)
+
+    private fun progress(
+        base: TaskDraft,
+        incoming: TaskDraft,
+        prefix: String,
+        apologizeIfNothingNew: Boolean
+    ): EngineResult {
+        val absorbed = absorb(base, incoming)
+        val merged = absorbed.draft
+        if (merged.nextMissing() == null) return finishDraft(merged)
+
+        draft = merged
+        val sorry = if (apologizeIfNothingNew && absorbed.heard.isEmpty() && absorbed.problems.isEmpty()) {
+            "Sorry, I didn't catch that. "
+        } else ""
+        return ask(merged, prefix = prefix + sorry, heard = absorbed.heard, problems = absorbed.problems)
+    }
+
+    /** The question for the next missing detail, after reading back what was just understood. */
+    private fun ask(
+        d: TaskDraft,
+        prefix: String = "",
+        heard: List<String> = emptyList(),
+        problems: List<String> = emptyList()
+    ): EngineResult {
+        val spoken = buildString {
+            append(prefix)
+            problems.forEach { append(it).append(' ') }
+            if (heard.isNotEmpty()) append("Got it: ").append(heard.joinToString(", ")).append(". ")
+            append(question(d))
+        }
+        return EngineResult(Outcome.NEEDS_INFO, spoken)
+    }
+
+    private fun question(d: TaskDraft): String = when (d.nextMissing()) {
+        DraftField.TITLE, null -> "What should I call the task?"
+        DraftField.DEADLINE -> "When is ${d.title} due?"
+        DraftField.DURATION -> "How long will ${d.title} take?"
+        DraftField.PRIORITY -> "Is ${d.title} high, medium or low priority?"
+    }
+
+    /** Appended to the answer of an unrelated command so the user is brought back to the open question. */
+    private suspend fun withDraftReminder(command: TaskCommand): EngineResult {
+        val pending = draft
+        val result = dispatch(command)
+        if (pending == null) return result
+        val lead = pending.title?.let { "Back to $it." } ?: "Back to the new task."
+        return result.copy(spoken = "${result.spoken} $lead ${question(pending)}")
+    }
+
+    private fun discardDraft(): EngineResult {
+        val pending = draft ?: return reject("There is no new task to cancel.")
+        draft = null
+        return EngineResult(Outcome.OK, "Okay, I won't add ${pending.title ?: "the new task"}.")
+    }
+
+    private fun finishDraft(complete: TaskDraft): EngineResult {
+        draft = null
+        val result = add(complete.toAddTask()!!)
+        // The plain add() sentence never mentions priority, which is now always a spoken answer.
+        return if (result.isSuccess) {
+            result.copy(spoken = "${result.spoken} ${complete.priority!!.label} priority.")
+        } else result
     }
 
     private fun add(cmd: TaskCommand.AddTask): EngineResult {

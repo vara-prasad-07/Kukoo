@@ -2,11 +2,13 @@ package com.example.kukoo.ai
 
 import com.example.kukoo.domain.DayRef
 import com.example.kukoo.domain.DeadlineSpec
+import com.example.kukoo.domain.DraftField
 import com.example.kukoo.domain.PlanScope
 import com.example.kukoo.domain.Priority
 import com.example.kukoo.domain.QueryScope
 import com.example.kukoo.domain.Recurrence
 import com.example.kukoo.domain.TaskCommand
+import com.example.kukoo.domain.TaskDraft
 import com.example.kukoo.domain.TaskPatch
 import com.example.kukoo.domain.TaskRef
 import java.time.DayOfWeek
@@ -20,7 +22,123 @@ import java.util.Locale
  */
 class RuleBasedIntentParser : IntentParser {
 
-    override suspend fun parse(utterance: String, context: ParseContext): TaskCommand = parseNow(utterance)
+    override suspend fun parse(utterance: String, context: ParseContext): TaskCommand =
+        context.draft?.let { parseReply(utterance, it) } ?: parseNow(utterance)
+
+    /**
+     * Reads [utterance] as the answer to the question the assistant just asked about the task being
+     * set up ([draft]). A short reply like "an hour" or "high" means nothing on its own, so it is
+     * read for the detail that was asked for; anything that is not an answer falls through to the
+     * ordinary commands, so "what's due today?" still works mid-question.
+     */
+    fun parseReply(utterance: String, draft: TaskDraft): TaskCommand {
+        val t = normalize(utterance)
+        if (t.isEmpty()) return TaskCommand.Unsupported(utterance)
+        if (discardDraft.matches(t)) return TaskCommand.DiscardDraft
+        val expecting = draft.nextMissing() ?: return parseNow(utterance)
+        if (expecting == DraftField.TITLE) return titleReply(t, utterance)
+
+        // A command that clearly concerns another task wins over reading its words as an answer:
+        // "what's due today" is not a deadline, and "move the client deck to tomorrow" is not either.
+        val command = parseNow(utterance)
+        when (command) {
+            is TaskCommand.QueryTasks, TaskCommand.EndCall, TaskCommand.Undo, is TaskCommand.Replan,
+            is TaskCommand.Snooze, is TaskCommand.CompleteTask, is TaskCommand.DeleteTask,
+            is TaskCommand.ReopenTask -> return command
+            is TaskCommand.UpdateTask -> {
+                if (!aboutTheDraft(command.ref)) return command
+                // "make it high priority", "it takes an hour": an edit of the task being set up.
+                val p = command.patch
+                val edit = TaskDraft(deadline = p.deadline, durationMin = p.durationMin, priority = p.priority)
+                return if (edit.isBlank) command else TaskCommand.FillTask(edit)
+            }
+            else -> Unit
+        }
+        val answer = replyFields(t, expecting)
+        return if (!answer.isBlank) TaskCommand.FillTask(answer) else command
+    }
+
+    /** "it", "that", "the task": words for the task being set up, or no task named at all. */
+    private fun aboutTheDraft(ref: TaskRef): Boolean = when (ref) {
+        TaskRef.Last -> true
+        is TaskRef.ByTitle -> ref.query.lowercase(Locale.ROOT) in draftWords
+        is TaskRef.ById -> false
+    }
+
+    /**
+     * The assistant asked what to call the task, so the whole reply is a name (with any time, length
+     * or priority in it peeled off). It is deliberately *not* run through the command patterns:
+     * "finish the report" or "cancel subscription" are task names here, not commands.
+     */
+    private fun titleReply(t: String, heard: String): TaskCommand {
+        if (endCall.matches(t) || isQuery(t)) return parseNow(heard)
+        return when (val built = buildAdd(t.replace(titleLeadIn, ""), heard)) {
+            is TaskCommand.AddTask -> TaskCommand.FillTask(TaskDraft.of(built))
+            // No name in it (only "tomorrow at 5"): keep the details, ask for the name again.
+            is TaskCommand.StartTask ->
+                if (built.draft.isBlank) TaskCommand.Unsupported(heard) else TaskCommand.FillTask(built.draft)
+            else -> built
+        }
+    }
+
+    /** Pulls out whatever [expecting] and its neighbours could be in a short reply. */
+    private fun replyFields(t: String, expecting: DraftField): TaskDraft {
+        var rest = " $t "
+        var minutes: Int? = null
+        var priority: Priority? = null
+
+        durationPrefixed.find(rest)?.let { m ->
+            durationFrom(m)?.let {
+                minutes = it
+                rest = rest.replaceRange(m.range, " ")
+            }
+        }
+        // "not urgent" contains "urgent", so the negation has to be looked for first.
+        val negated = notUrgent.find(rest)
+        if (negated != null) {
+            priority = Priority.LOW
+            rest = rest.replaceRange(negated.range, " ")
+        } else {
+            priorityRe.find(rest)?.let { m ->
+                priority = priorityFrom(m)
+                rest = rest.replaceRange(m.range, " ")
+            }
+        }
+        val extracted = extractWhen(rest.trim())
+        var spec: DeadlineSpec? = extracted.spec
+        val left = extracted.rest
+
+        // A lone word or number is only an answer to the question that was actually asked.
+        when (expecting) {
+            DraftField.DURATION -> if (minutes == null) minutes = bareDuration(left)
+            DraftField.PRIORITY -> if (priority == null) priority = bareWordPriority(left)
+            DraftField.DEADLINE -> if (spec == null) spec = bareHour(left)
+            DraftField.TITLE -> Unit
+        }
+        return TaskDraft(deadline = spec, durationMin = minutes, priority = priority)
+    }
+
+    private fun priorityFrom(m: MatchResult): Priority = when {
+        m.groupValues[1].isNotEmpty() -> Priority.fromName(m.groupValues[1])
+        m.groupValues[2].isNotEmpty() -> Priority.fromName(m.groupValues[2])
+        else -> Priority.HIGH
+    }
+
+    private fun bareWordPriority(text: String): Priority? = when {
+        lowWords.containsMatchIn(text) -> Priority.LOW
+        highWords.containsMatchIn(text) -> Priority.HIGH
+        mediumWords.containsMatchIn(text) -> Priority.MEDIUM
+        else -> null
+    }
+
+    private fun bareDuration(text: String): Int? =
+        snoozeMinutes(text.replace(durationLeadIn, "").trim())
+
+    /** "6" or "6:30" as the answer to *when*: read like "at 6" would be. */
+    private fun bareHour(text: String): DeadlineSpec? {
+        val m = bareHourRe.matchEntire(text.trim()) ?: return null
+        return parseTime(m.groupValues[1], m.groupValues[2], "")?.let { DeadlineSpec.Relative(time = it) }
+    }
 
     fun parseNow(utterance: String): TaskCommand {
         val t = normalize(utterance)
@@ -75,6 +193,9 @@ class RuleBasedIntentParser : IntentParser {
             val spec = extractWhen(m.groupValues[2]).spec ?: return TaskCommand.Unsupported(utterance)
             return TaskCommand.UpdateTask(byTitle(m.groupValues[1]), TaskPatch(deadline = spec))
         }
+
+        // "add a task" with nothing else: there is no name yet, so the assistant will ask for one.
+        if (bareAdd.matches(t)) return TaskCommand.StartTask()
 
         (add.matchEntire(t) ?: newTask.matchEntire(t) ?: remind.matchEntire(t))?.let { m ->
             return buildAdd(m.groupValues[1], utterance)
@@ -139,7 +260,12 @@ class RuleBasedIntentParser : IntentParser {
         }
         val extracted = extractWhen(rest.trim())
         val title = cleanTitle(extracted.rest)
-        if (title.isEmpty()) return TaskCommand.Unsupported(heard)
+        if (title.isEmpty() || Grounding.isFillerTitle(title)) {
+            // "add tomorrow at 5", "add a task": something is being added, but it has no name yet.
+            return TaskCommand.StartTask(
+                TaskDraft(deadline = extracted.spec, durationMin = minutes, priority = priority, recurrence = recurrence)
+            )
+        }
         return TaskCommand.AddTask(title, extracted.spec, minutes, priority, recurrence)
     }
 
@@ -334,6 +460,28 @@ class RuleBasedIntentParser : IntentParser {
                 "(?:called\\s+|named\\s+|to\\s+)?(.+)"
         )
         val newTask = Regex("(?:please )?new\\s+(?:task|to-?do)\\s+(.+)")
+        val bareAdd = Regex(
+            "(?:please )?(?:(?:add|create)(?: (?:me )?(?:a|an|the))?(?: new)?(?: (?:task|to-?do|reminder|item))?|" +
+                "new (?:task|to-?do|reminder))"
+        )
+
+        // Replies while a task is being set up
+        val discardDraft = Regex(
+            "(?:please )?(?:cancel(?: (?:it|that|this|the task|the new task|adding))?|never ?mind|" +
+                "forget (?:it|that|about it)|scrap (?:it|that)|drop (?:it|that)|skip (?:it|that)|" +
+                "discard(?: it| that)?|don'?t add (?:it|that|anything))"
+        )
+        val titleLeadIn = Regex(
+            "^(?:(?:it'?s|it is|its|the (?:task|name|title) is|call it|name it|title it|call the task|" +
+                "name the task|it should be|the name should be)\\s+)"
+        )
+        val durationLeadIn = Regex("^(?:(?:it(?:'ll| will)? takes?|maybe|about|around|roughly|like|for)\\s+)+")
+        val draftWords = setOf("it", "its", "that", "this", "the", "new", "the new")
+        val notUrgent = Regex("\\snot\\s+(?:that\\s+|very\\s+|so\\s+)?(?:urgent|important)(?=\\s)")
+        val bareHourRe = Regex("(\\d{1,2})(?::(\\d{2}))?")
+        val lowWords = Regex("\\b(?:low|minor|unimportant|whenever|no rush|not (?:that |very |so )?(?:urgent|important))\\b")
+        val highWords = Regex("\\b(?:high|urgent|important|critical|asap|top)\\b")
+        val mediumWords = Regex("\\b(?:medium|normal|moderate|average|mid|regular|default)\\b")
         val remind = Regex("(?:please )?(?:remind me to|i need to|i have to|i must)\\s+(.+)")
 
         val queryVerb = Regex("^(?:please )?(?:what|whats|what's|show|list|tell|read|give)\\b")

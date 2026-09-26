@@ -130,7 +130,11 @@ class AppFlowTest {
         vm.say("Delete the expense task", "Done. I deleted Expense report.")
         assertTrue(vm.state.value.tasks.none { it.title == "Expense report" })
 
+        // A new task is only added once it has a name, a deadline, a duration and a priority.
         vm.say("Add a task: finish the report tomorrow at 5")
+        assertTrue(vm.state.value.tasks.none { it.title == "Finish the report" })
+        vm.say("45 minutes")
+        vm.say("high")
         assertNotNull(vm.task("Finish the report").deadline)
 
         // Everything above is really in the database, not just in memory.
@@ -191,6 +195,61 @@ class AppFlowTest {
         vm.onMicRelease()
         assertNotNull(vm.state.value.session.hint)
         assertEquals(Phase.IDLE, vm.state.value.session.phase)
+    }
+
+    @Test
+    fun addingATask_asksForEveryMissingDetail_beforeSavingAnything() {
+        val vm = newVm()
+        vm.startAndAwaitBriefing()
+        val before = vm.state.value.tasks.size
+
+        vm.say("add a task", "What should I call the task?")
+        assertEquals(before, vm.state.value.tasks.size)
+
+        vm.say("call mom", "Got it: Call mom. When is Call mom due?")
+        vm.say("tomorrow at 6", "Got it: due tomorrow at 6 PM. How long will Call mom take?")
+        assertEquals(before, vm.state.value.tasks.size)
+
+        // Something that is not an answer gets the same question again, not a guess.
+        vm.say("purple", "Sorry, I didn't catch that. How long will Call mom take?")
+        assertEquals(before, vm.state.value.tasks.size)
+
+        vm.say("half an hour", "Got it: 30 minutes. Is Call mom high, medium or low priority?")
+        assertEquals(before, vm.state.value.tasks.size)
+
+        vm.say("medium")
+        assertEquals(before + 1, vm.state.value.tasks.size)
+        val saved = vm.task("Call mom")
+        assertEquals(millis(TOMORROW, 18), saved.deadline)
+        assertEquals(30, saved.durationMin)
+        assertEquals(Priority.MEDIUM, saved.priority)
+        assertTrue(vm.state.value.session.turns.last().text.endsWith("Medium priority."))
+        assertTrue(vm.state.value.canUndo)
+    }
+
+    @Test
+    fun aQuestionMidDialog_isAnswered_thenTheDialogContinues() {
+        val vm = newVm()
+        vm.startAndAwaitBriefing()
+        vm.say("add call mom tomorrow at 6 pm")   // asks how long
+        vm.say("what's due today")
+        assertTrue(vm.state.value.session.turns.last().text.endsWith("Back to Call mom. How long will Call mom take?"))
+        vm.say("20 minutes")
+        vm.say("low")
+        assertEquals(20, vm.task("Call mom").durationMin)
+    }
+
+    @Test
+    fun cancellingMidDialog_addsNothing() {
+        val vm = newVm()
+        vm.startAndAwaitBriefing()
+        val before = vm.state.value.tasks.size
+        vm.say("add call mom tomorrow at 6 pm")
+        vm.say("never mind", "Okay, I won't add Call mom.")
+        assertEquals(before, vm.state.value.tasks.size)
+        // Nothing is pending any more, so a bare answer is not read as one.
+        vm.say("high")
+        assertEquals(before, vm.state.value.tasks.size)
     }
 
     @Test
@@ -277,6 +336,9 @@ class AppFlowTest {
         assertFalse(vm.state.value.canUndo)
 
         vm.say("Add a task: water plants tomorrow at 5")
+        assertFalse("still asking, so nothing was added to undo", vm.state.value.canUndo)
+        vm.say("20 minutes")
+        vm.say("low")
         assertTrue(vm.state.value.canUndo)
         val actions = vm.state.value.session.quickActions
         assertEquals(listOf("+1 Hour", "Tomorrow 9 AM", "Snooze 15m"), actions.map { it.label })

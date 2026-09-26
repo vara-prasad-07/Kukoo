@@ -72,6 +72,19 @@ sealed interface TaskCommand {
         val notes: String? = null
     ) : TaskCommand
 
+    /**
+     * The user wants a new task but has not named it yet (it may still carry other details, e.g.
+     * "add something for tomorrow"). A named task arrives as [AddTask] instead. Spoken adds of either
+     * kind go through [TaskEngine.executeSpoken], which asks for whatever is still missing.
+     */
+    data class StartTask(val draft: TaskDraft = TaskDraft()) : TaskCommand
+
+    /** The user's answer to the question about the task being set up; merged into the pending draft. */
+    data class FillTask(val draft: TaskDraft) : TaskCommand
+
+    /** Drop the task being set up ("never mind", "cancel"). */
+    data object DiscardDraft : TaskCommand
+
     data class UpdateTask(val ref: TaskRef, val patch: TaskPatch) : TaskCommand
     data class CompleteTask(val ref: TaskRef) : TaskCommand
     data class ReopenTask(val ref: TaskRef) : TaskCommand
@@ -96,6 +109,11 @@ enum class Outcome {
     REJECTED,
     /** More than one task matched, or the reference could not be resolved. */
     NEEDS_CLARIFICATION,
+    /**
+     * A new task is missing a required detail and the assistant is asking for it. Not a problem, so
+     * it is shown like any other reply; the conversation just continues.
+     */
+    NEEDS_INFO,
     /** The user asked to hang up. */
     END_CALL,
     /** The utterance was not a supported command. */

@@ -81,7 +81,7 @@ import java.time.Clock
 /** The supported commands. Tapping one sends it, so the demo works even if the microphone does not. */
 private val SUGGESTIONS = listOf(
     "What's due today?",
-    "Add a task: finish the report tomorrow at 5",
+    "Add a task",
     "Move the client deck to tomorrow",
     "Mark the follow-up as done",
     "Delete the expense task",

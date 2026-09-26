@@ -105,7 +105,8 @@ class ScreenshotTest {
             HomeScreen(
                 state = state, format = format, clock = clock,
                 onTalk = {}, onAdd = {}, onEdit = {}, onToggleDone = {}, onDelete = {},
-                onPlan = {}, onRingNow = {}, onRingIn = {}, onDailyCall = {}, onResetDemo = {}, onNoticeShown = {}
+                onPlan = {}, onRingNow = {}, onRingIn = {}, onDailyCall = {}, onOpenSetup = {},
+                onResetDemo = {}, onNoticeShown = {}
             )
         }
 

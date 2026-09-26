@@ -1,10 +1,15 @@
 package com.example.kukoo.ui
 
 import android.app.Application
+import android.content.pm.ApplicationInfo
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.kukoo.KukooApp
+import com.example.kukoo.ai.InstallProgress
 import com.example.kukoo.ai.ParseContext
+import com.example.kukoo.ai.SpeechModel
+import com.geniex.sdk.ModelManagerWrapper
 import com.example.kukoo.call.CallRinger
 import com.example.kukoo.call.IncomingCallNotifier
 import com.example.kukoo.domain.DeadlineSpec
@@ -29,6 +34,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -58,6 +64,9 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
     private var turnJob: Job? = null
     private var nextTurnId = 1L
 
+    /** Per-turn diagnostics are for debug builds only: what was heard and how it was understood. */
+    private val debuggable = (application.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
     init {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { container.seedOnFirstRun() }
@@ -76,6 +85,8 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
             Screen.HOME -> return false
             Screen.INCOMING_CALL, Screen.SESSION -> endToHome()
             Screen.PLAN -> _state.update { it.copy(screen = it.planReturnsTo) }
+            // A download keeps running in the background; leaving the screen does not cancel it.
+            Screen.SETUP -> _state.update { it.copy(screen = Screen.HOME) }
         }
         return true
     }
@@ -182,6 +193,152 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
                 notify("Demo tasks reset.")
             }
         }
+    }
+
+    // ---- on-device model setup -----------------------------------------------------------
+
+    fun openModelSetup() {
+        _state.update { it.copy(screen = Screen.SETUP) }
+        refreshSetup()
+    }
+
+    fun closeModelSetup() = _state.update { it.copy(screen = Screen.HOME) }
+
+    /** Recomputes what is installed. Called on entry and after every download finishes. */
+    fun refreshSetup() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val speech = SpeechModel.entries.map { model ->
+                val installed = container.models.isInstalled(model)
+                ModelRow(
+                    id = model.name,
+                    label = model.label,
+                    detail = if (installed) "Installed" else "${model.bytes / 1_000_000} MB" +
+                        if (model.required) "" else " · optional",
+                    installed = installed,
+                )
+            }
+            val llmReady = container.genieX.isModelDownloaded
+            val chipset = runCatching { container.genieX.detectChipset() }.getOrNull().orEmpty()
+            val llm = ModelRow(
+                id = "LLM",
+                label = "Qwen3-VL-4B-Instruct (NPU)",
+                detail = if (llmReady) "Installed" else "Downloads from Qualcomm AI Hub",
+                installed = llmReady,
+            )
+            _state.update { it.copy(setup = it.setup.copy(speech = speech, llm = llm, chipset = chipset)) }
+        }
+    }
+
+    fun onMicPermissionResult(granted: Boolean) =
+        _state.update { it.copy(setup = it.setup.copy(micGranted = granted)) }
+
+    /** Downloads the sherpa-onnx speech bundles, updating one row at a time. */
+    fun downloadSpeechModels() {
+        if (_state.value.setup.busy) return
+        _state.update { it.copy(setup = it.setup.copy(busy = true)) }
+        viewModelScope.launch {
+            container.models.install()
+                .onCompletion { _state.update { s -> s.copy(setup = s.setup.copy(busy = false)) }; refreshSetup() }
+                .collect { progress -> updateSpeechRow(progress) }
+        }
+    }
+
+    private fun updateSpeechRow(progress: InstallProgress) = _state.update { state ->
+        val rows = state.setup.speech.map { row ->
+            if (row.id != progress.model.name) row else row.copy(
+                fraction = progress.fraction,
+                installed = progress.done,
+                downloading = !progress.done && progress.error == null,
+                error = progress.error,
+                detail = when {
+                    progress.error != null -> "Failed: ${progress.error}"
+                    progress.done -> "Installed"
+                    else -> "${progress.downloaded / 1_000_000} / ${progress.total / 1_000_000} MB"
+                },
+            )
+        }
+        state.copy(setup = state.setup.copy(speech = rows))
+    }
+
+    /**
+     * Pulls the NPU model bundle, then loads it so the first call does not pay the cold-load cost.
+     * GenieX reports progress per file, so the bar is the sum over all files in flight.
+     */
+    fun downloadLlm() {
+        if (_state.value.setup.busy) return
+        _state.update { it.copy(setup = it.setup.copy(busy = true)) }
+        viewModelScope.launch {
+            try {
+                // The bundle is ~1.5 GB. A single dropped connection on venue wifi would otherwise
+                // throw away the whole download, so keep retrying: GenieX leaves the partial files
+                // in place and resumes from where it stopped.
+                for (attempt in 1..PULL_ATTEMPTS) {
+                    val failure = attemptPull(attempt)
+                    if (failure == null) return@launch
+                    if (attempt == PULL_ATTEMPTS) {
+                        setLlmRow(detail = "Failed after $attempt tries: $failure", error = failure)
+                    } else {
+                        setLlmRow(detail = "Connection lost — resuming (try ${attempt + 1})…", downloading = true)
+                        delay(RETRY_DELAY_MS)
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } finally {
+                _state.update { it.copy(setup = it.setup.copy(busy = false)) }
+            }
+        }
+    }
+
+    /** One pull attempt. Returns null on success, or the failure message to retry on. */
+    private suspend fun attemptPull(attempt: Int): String? {
+        setLlmRow(detail = if (attempt == 1) "Contacting AI Hub…" else "Resuming…", downloading = true)
+        var failure: String? = null
+        var completed = false
+        try {
+            container.genieX.pullModel().collect { event ->
+                when (event) {
+                    is ModelManagerWrapper.PullEvent.Progress -> {
+                        val got = event.files.sumOf { it.downloaded_bytes }
+                        val total = event.files.sumOf { it.total_bytes.coerceAtLeast(0) }
+                        setLlmRow(
+                            detail = if (total > 0) "${got / 1_000_000} / ${total / 1_000_000} MB"
+                            else "${got / 1_000_000} MB",
+                            fraction = if (total > 0) (got.toFloat() / total).coerceIn(0f, 1f) else 0f,
+                            downloading = true,
+                        )
+                    }
+                    ModelManagerWrapper.PullEvent.Completed -> completed = true
+                    is ModelManagerWrapper.PullEvent.Error -> failure = event.message
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            failure = e.message ?: e.toString()
+        }
+        if (!completed) return failure ?: "Download did not finish"
+
+        setLlmRow(detail = "Loading onto the NPU…", fraction = 1f, downloading = true)
+        val ok = withContext(Dispatchers.IO) { container.genieX.ensureLoaded() }
+        setLlmRow(
+            detail = if (ok) "Installed" else "Downloaded, but the NPU load failed",
+            fraction = 1f,
+            installed = ok,
+        )
+        return null
+    }
+
+    private fun setLlmRow(
+        detail: String,
+        fraction: Float = 0f,
+        installed: Boolean = false,
+        downloading: Boolean = false,
+        error: String? = null,
+    ) = _state.update { state ->
+        val row = (state.setup.llm ?: ModelRow("LLM", "Qwen3-VL-4B-Instruct (NPU)", detail))
+            .copy(detail = detail, fraction = fraction, installed = installed, downloading = downloading, error = error)
+        state.copy(setup = state.setup.copy(llm = row))
     }
 
     // ---- call trigger --------------------------------------------------------------------
@@ -332,9 +489,13 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
         val result = try {
             withContext(Dispatchers.IO) {
                 val openTitles = engine.tasks().filter { !it.isDone }.map { it.title }
-                val parsed = container.parser.parse(text, ParseContext(openTitles))
+                // The pending draft tells the parser a short reply ("an hour", "high") answers the
+                // question just asked. Spoken adds are asked for name, deadline, duration and priority.
+                val parsed = container.parser.parse(text, ParseContext(openTitles, engine.pendingDraft))
                 command = parsed
-                engine.execute(parsed)
+                engine.executeSpoken(parsed).also { result ->
+                    if (debuggable) Log.i(TAG, "heard=\"$text\" parsed=$parsed -> ${result.outcome}: ${result.spoken}")
+                }
             }
         } catch (e: CancellationException) {
             throw e
@@ -411,7 +572,8 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
         if (!result.isSuccess) return
         when (command) {
             TaskCommand.Undo -> _state.update { it.copy(canUndo = false) }
-            is TaskCommand.AddTask, is TaskCommand.UpdateTask, is TaskCommand.CompleteTask,
+            is TaskCommand.AddTask, is TaskCommand.StartTask, is TaskCommand.FillTask,
+            is TaskCommand.UpdateTask, is TaskCommand.CompleteTask,
             is TaskCommand.ReopenTask, is TaskCommand.DeleteTask, is TaskCommand.Snooze -> {
                 _state.update { it.copy(canUndo = true) }
                 _events.tryEmit(UiEvent.ShowUndoSnackbar(result.spoken))
@@ -470,5 +632,10 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
     }
 }
 
+private const val TAG = "KukooTurn"
 private const val RING_TIMEOUT_MS = 30_000L
 private const val SNOOZE_MINUTES = 15
+
+/** A 1.5 GB pull over conference wifi drops often; each retry resumes from the partial files. */
+private const val PULL_ATTEMPTS = 40
+private const val RETRY_DELAY_MS = 3_000L

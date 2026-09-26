@@ -12,6 +12,11 @@ composeBom = "2026.02.01"
 materialIcons = "1.7.8"
 robolectric = "4.16.1"
 
+# On-device AI: Qualcomm GenieX (NPU LLM/VLM) + sherpa-onnx (STT/TTS).
+geniex = "0.7.0"
+coroutines = "1.10.2"
+commonsCompress = "1.28.0"
+
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
@@ -31,6 +36,13 @@ androidx-compose-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-te
 androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
 androidx-compose-material-icons-core = { group = "androidx.compose.material", name = "material-icons-core", version.ref = "materialIcons" }
 androidx-compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended", version.ref = "materialIcons" }
+
+# GenieX ships the Kotlin wrappers plus libnpu_jni.so and the qairt / llama_cpp plugin .so files.
+# Its POM declares no dependencies, so coroutines must be supplied here (its API returns Flow).
+geniex-android = { group = "com.qualcomm.qti", name = "geniex-android", version.ref = "geniex" }
+kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+# Speech model bundles ship as .tar.bz2; Android has gzip but no bzip2 decoder.
+commons-compress = { group = "org.apache.commons", name = "commons-compress", version.ref = "commonsCompress" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

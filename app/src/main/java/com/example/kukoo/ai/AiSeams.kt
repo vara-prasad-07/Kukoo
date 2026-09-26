@@ -1,9 +1,19 @@
 package com.example.kukoo.ai
 
 import com.example.kukoo.domain.TaskCommand
+import com.example.kukoo.domain.TaskDraft
 
-/** Extra context an LLM-backed parser can use to ground the request. */
-data class ParseContext(val openTaskTitles: List<String> = emptyList())
+/**
+ * Extra context a parser can use to read the request.
+ *
+ * [draft] is set while the assistant is in the middle of adding a task and has just asked for a
+ * missing detail: the next utterance is then most likely the answer ("an hour", "high"), not a
+ * fresh command.
+ */
+data class ParseContext(
+    val openTaskTitles: List<String> = emptyList(),
+    val draft: TaskDraft? = null
+)
 
 /**
  * Turns what the user said into one supported [TaskCommand].
@@ -26,6 +36,21 @@ interface SpeechToText {
 interface Speaker {
     suspend fun speak(text: String)
     fun stop()
+}
+
+/**
+ * Speaks with [neural] once its voice model is installed, and with [platform] until then, so the
+ * assistant is never mute while the download is still running.
+ */
+class FallbackSpeaker(private val neural: SherpaSpeaker, private val platform: Speaker) : Speaker {
+    override suspend fun speak(text: String) {
+        if (neural.isReady) neural.speak(text) else platform.speak(text)
+    }
+
+    override fun stop() {
+        neural.stop()
+        platform.stop()
+    }
 }
 
 /** Placeholder until the STT model is chosen and integrated. */

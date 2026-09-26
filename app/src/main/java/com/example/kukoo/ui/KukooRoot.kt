@@ -25,6 +25,14 @@ import com.example.kukoo.ui.home.HomeScreen
 import com.example.kukoo.ui.home.TaskEditorSheet
 import com.example.kukoo.ui.plan.PlanScreen
 import com.example.kukoo.ui.session.VoiceSessionScreen
+import com.example.kukoo.ui.setup.ModelSetupScreen
+import android.content.Context
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
+
+private fun hasMicPermission(context: Context): Boolean =
+    ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+        PackageManager.PERMISSION_GRANTED
 
 /** Switches between the four screens (Home, Incoming Call, Voice Session, Plan Result). */
 @Composable
@@ -39,6 +47,11 @@ fun KukooRoot(vm: KukooViewModel) {
         }
     }
 
+    // Local speech recognition still needs the runtime microphone grant.
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        vm.onMicPermissionResult(granted)
+    }
+
     var showDailyDialog by rememberSaveable { mutableStateOf(false) }
 
     BackHandler(enabled = state.screen != Screen.HOME) { vm.onBack() }
@@ -49,7 +62,12 @@ fun KukooRoot(vm: KukooViewModel) {
                 state = state,
                 format = vm.format,
                 clock = vm.clock,
-                onTalk = vm::startSession,
+                onTalk = {
+                    // Asking here rather than at launch: the session still works with typed input
+                    // while the dialog is up, so this never blocks starting a call.
+                    if (!hasMicPermission(context)) micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                    vm.startSession()
+                },
                 onAdd = { vm.openEditor(null) },
                 onEdit = { vm.openEditor(it) },
                 onToggleDone = vm::toggleDone,
@@ -61,6 +79,10 @@ fun KukooRoot(vm: KukooViewModel) {
                     vm.ringIn(10)
                 },
                 onDailyCall = { showDailyDialog = true },
+                onOpenSetup = {
+                    vm.onMicPermissionResult(hasMicPermission(context))
+                    vm.openModelSetup()
+                },
                 onResetDemo = vm::resetDemoData,
                 onNoticeShown = vm::dismissNotice,
                 events = vm.events,
@@ -96,6 +118,14 @@ fun KukooRoot(vm: KukooViewModel) {
                     onBack = vm::onBack
                 )
             }
+
+            Screen.SETUP -> ModelSetupScreen(
+                state = state.setup,
+                onBack = vm::closeModelSetup,
+                onDownloadSpeech = vm::downloadSpeechModels,
+                onDownloadLlm = vm::downloadLlm,
+                onRequestMic = { micPermission.launch(Manifest.permission.RECORD_AUDIO) }
+            )
         }
     }
 

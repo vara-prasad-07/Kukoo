@@ -4,8 +4,8 @@ import com.example.kukoo.domain.Outcome
 import com.example.kukoo.domain.Plan
 import com.example.kukoo.domain.Task
 
-/** The four screens from the implementation document. */
-enum class Screen { HOME, INCOMING_CALL, SESSION, PLAN }
+/** The four screens from the implementation document, plus one-off on-device model setup. */
+enum class Screen { HOME, INCOMING_CALL, SESSION, PLAN, SETUP }
 
 /** Turn-based voice loop: listen -> think -> speak -> idle. */
 enum class Phase { IDLE, LISTENING, THINKING, SPEAKING }
@@ -40,6 +40,29 @@ data class SessionState(
 /** [task] == null means "new task". [error] is the engine's reason for refusing a save. */
 data class EditorState(val task: Task?, val error: String? = null)
 
+/**
+ * One downloadable model on the setup screen. [fraction] is only meaningful while downloading;
+ * [detail] carries the human-readable size, state or failure reason.
+ */
+data class ModelRow(
+    val id: String,
+    val label: String,
+    val detail: String,
+    val fraction: Float = 0f,
+    val installed: Boolean = false,
+    val downloading: Boolean = false,
+    val error: String? = null
+)
+
+/** First-run (or on-demand) download of the on-device models. */
+data class SetupState(
+    val speech: List<ModelRow> = emptyList(),
+    val llm: ModelRow? = null,
+    val busy: Boolean = false,
+    val micGranted: Boolean = false,
+    val chipset: String = ""
+)
+
 data class AppState(
     val screen: Screen = Screen.HOME,
     val tasks: List<Task> = emptyList(),
@@ -48,6 +71,7 @@ data class AppState(
     val plan: Plan? = null,
     val planReturnsTo: Screen = Screen.HOME,
     val editor: EditorState? = null,
+    val setup: SetupState = SetupState(),
     val notice: String? = null,
     val nextCallAt: Long? = null,
     /** Show the call above the lock screen (only for calls started by the alarm). */

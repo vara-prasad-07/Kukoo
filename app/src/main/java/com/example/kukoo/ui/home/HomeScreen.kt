@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
@@ -95,6 +96,7 @@ fun HomeScreen(
     onRingNow: () -> Unit,
     onRingIn: () -> Unit,
     onDailyCall: () -> Unit,
+    onOpenSetup: () -> Unit,
     onResetDemo: () -> Unit,
     onNoticeShown: () -> Unit,
     events: Flow<UiEvent> = emptyFlow(),
@@ -181,6 +183,7 @@ fun HomeScreen(
                     onRingNow = onRingNow,
                     onRingIn = onRingIn,
                     onDailyCall = onDailyCall,
+                    onOpenSetup = onOpenSetup,
                     onResetDemo = onResetDemo
                 )
             }
@@ -230,6 +233,7 @@ private fun Header(
     onRingNow: () -> Unit,
     onRingIn: () -> Unit,
     onDailyCall: () -> Unit,
+    onOpenSetup: () -> Unit,
     onResetDemo: () -> Unit
 ) {
     var menu by remember { mutableStateOf(false) }
@@ -269,6 +273,11 @@ private fun Header(
                     text = { Text("Daily call time…") },
                     leadingIcon = { Icon(Icons.Default.Alarm, contentDescription = null) },
                     onClick = { menu = false; onDailyCall() }
+                )
+                DropdownMenuItem(
+                    text = { Text("AI models…") },
+                    leadingIcon = { Icon(Icons.Default.Memory, contentDescription = null) },
+                    onClick = { menu = false; onOpenSetup() }
                 )
                 DropdownMenuItem(
                     text = { Text("Reset demo tasks") },

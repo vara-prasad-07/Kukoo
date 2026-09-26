@@ -1,5 +1,6 @@
 package com.example.kukoo
 
+import com.example.kukoo.ai.ParseContext
 import com.example.kukoo.ai.RuleBasedIntentParser
 import com.example.kukoo.domain.DayRef
 import com.example.kukoo.domain.DeadlineSpec
@@ -8,8 +9,10 @@ import com.example.kukoo.domain.Priority
 import com.example.kukoo.domain.QueryScope
 import com.example.kukoo.domain.Recurrence
 import com.example.kukoo.domain.TaskCommand
+import com.example.kukoo.domain.TaskDraft
 import com.example.kukoo.domain.TaskPatch
 import com.example.kukoo.domain.TaskRef
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -125,8 +128,16 @@ class RuleBasedIntentParserTest {
         parse("add taskbar redesign")
     )
 
-    @Test fun addWithNoTitle_isUnsupported() =
-        assertTrue(parse("add tomorrow at 5") is TaskCommand.Unsupported)
+    @Test fun addWithNoTitle_startsATask_andKeepsTheDetails() = assertEquals(
+        TaskCommand.StartTask(TaskDraft(deadline = rel(DayRef.Tomorrow, 17))),
+        parse("add tomorrow at 5")
+    )
+
+    @Test fun bareAdd_startsATask_soTheAssistantCanAskForTheName() {
+        listOf("add", "add a task", "create a new task", "new task", "please add a to-do").forEach {
+            assertEquals(it, TaskCommand.StartTask(), parse(it))
+        }
+    }
 
     @Test fun morningHoursDefaultToAm_afternoonHoursToPm() {
         assertEquals(rel(DayRef.Tomorrow, 9), (parse("add standup tomorrow at 9") as TaskCommand.AddTask).deadline)
@@ -205,4 +216,105 @@ class RuleBasedIntentParserTest {
     @Test fun caseAndPunctuationDoNotMatter() = assertEquals(
         parse("mark the follow-up as done"), parse("  MARK THE FOLLOW-UP AS DONE!!  ")
     )
+
+    // ---- replies while a new task is being set up ------------------------------------------
+
+    private val named = TaskDraft(title = "Call mom")
+    private val withDeadline = named.copy(deadline = rel(DayRef.Tomorrow, 18))
+    private val withDuration = withDeadline.copy(durationMin = 30)
+
+    private fun reply(text: String, draft: TaskDraft) = parser.parseReply(text, draft)
+    private fun fill(draft: TaskDraft) = TaskCommand.FillTask(draft)
+
+    @Test fun nameReply_isTheWholeSentence() =
+        assertEquals(fill(TaskDraft(title = "call mom")), reply("call mom", TaskDraft()))
+
+    @Test fun nameReply_isNeverReadAsACommand() {
+        // "finish", "cancel" and "delete" start a command anywhere else; here they start a name.
+        assertEquals(fill(TaskDraft(title = "finish the report")), reply("finish the report", TaskDraft()))
+        assertEquals(fill(TaskDraft(title = "cancel subscription")), reply("cancel subscription", TaskDraft()))
+        assertEquals(fill(TaskDraft(title = "delete old backups")), reply("delete old backups", TaskDraft()))
+    }
+
+    @Test fun nameReply_peelsOffTheDetailsItAlsoContains() = assertEquals(
+        fill(TaskDraft(title = "call mom", deadline = rel(DayRef.Tomorrow, 18), priority = Priority.HIGH)),
+        reply("call mom tomorrow at 6 pm high priority", TaskDraft())
+    )
+
+    @Test fun nameReply_withOnlyDetails_keepsThemAndStillNeedsAName() = assertEquals(
+        fill(TaskDraft(deadline = rel(DayRef.Tomorrow, 17))),
+        reply("tomorrow at 5", TaskDraft())
+    )
+
+    @Test fun nameReply_dropsTheLeadIn() {
+        assertEquals(fill(TaskDraft(title = "groceries")), reply("call it groceries", TaskDraft()))
+        assertEquals(fill(TaskDraft(title = "water plants")), reply("it's water plants", TaskDraft()))
+    }
+
+    @Test fun nameReply_thatIsNotAName_isUnsupported() {
+        assertTrue(reply("yes", TaskDraft()) is TaskCommand.Unsupported)
+        assertTrue(reply("um", TaskDraft()) is TaskCommand.Unsupported)
+        assertTrue(reply("a task", TaskDraft()) is TaskCommand.Unsupported)
+    }
+
+    @Test fun deadlineReply() {
+        assertEquals(fill(TaskDraft(deadline = rel(DayRef.Tomorrow, 18))), reply("tomorrow at 6", named))
+        assertEquals(fill(TaskDraft(deadline = rel(DayRef.Weekday(DayOfWeek.FRIDAY)))), reply("friday", named))
+        // A lone number is only a time because a time was just asked for.
+        assertEquals(fill(TaskDraft(deadline = rel(h = 18))), reply("6", named))
+    }
+
+    @Test fun durationReply() {
+        assertEquals(fill(TaskDraft(durationMin = 30)), reply("30 minutes", withDeadline))
+        assertEquals(fill(TaskDraft(durationMin = 60)), reply("an hour", withDeadline))
+        assertEquals(fill(TaskDraft(durationMin = 30)), reply("half an hour", withDeadline))
+        assertEquals(fill(TaskDraft(durationMin = 45)), reply("45", withDeadline))
+        assertEquals(fill(TaskDraft(durationMin = 20)), reply("for 20 minutes", withDeadline))
+        assertEquals(fill(TaskDraft(durationMin = 60)), reply("it takes an hour", withDeadline))
+    }
+
+    @Test fun priorityReply() {
+        assertEquals(fill(TaskDraft(priority = Priority.HIGH)), reply("high", withDuration))
+        assertEquals(fill(TaskDraft(priority = Priority.MEDIUM)), reply("medium priority", withDuration))
+        assertEquals(fill(TaskDraft(priority = Priority.LOW)), reply("low", withDuration))
+        assertEquals(fill(TaskDraft(priority = Priority.HIGH)), reply("urgent", withDuration))
+        assertEquals(fill(TaskDraft(priority = Priority.LOW)), reply("not urgent", withDuration))
+        assertEquals(fill(TaskDraft(priority = Priority.HIGH)), reply("make it high priority", withDuration))
+    }
+
+    @Test fun oneReplyCanCarryTwoDetails() = assertEquals(
+        fill(TaskDraft(durationMin = 30, priority = Priority.HIGH)),
+        reply("for 30 minutes high priority", withDeadline)
+    )
+
+    @Test fun backingOut_dropsTheDraft() {
+        listOf("never mind", "cancel", "cancel that", "forget it", "scrap that").forEach {
+            assertEquals(it, TaskCommand.DiscardDraft, reply(it, named))
+        }
+    }
+
+    @Test fun aCommandAboutAnotherTask_winsOverReadingItsWordsAsAnAnswer() {
+        // "today" and "tomorrow" are in these, but they are not the new task's deadline.
+        assertEquals(TaskCommand.QueryTasks(QueryScope.TODAY), reply("what's due today", withDeadline))
+        assertEquals(
+            TaskCommand.UpdateTask(TaskRef.ByTitle("client deck"), TaskPatch(deadline = rel(DayRef.Tomorrow))),
+            reply("move the client deck to tomorrow", withDeadline)
+        )
+        assertEquals(TaskCommand.DeleteTask(TaskRef.ByTitle("gym")), reply("delete the gym task", withDeadline))
+        assertEquals(TaskCommand.EndCall, reply("goodbye", withDeadline))
+    }
+
+    @Test fun aReplyThatIsNotAnAnswer_isUnsupported_soTheQuestionIsAskedAgain() {
+        assertTrue(reply("blah", withDeadline) is TaskCommand.Unsupported)
+        assertTrue(reply("yes", withDuration) is TaskCommand.Unsupported)
+    }
+
+    @Test fun theInterfaceUsesThePendingDraft_andIgnoresItOtherwise() = runBlocking {
+        assertEquals(
+            fill(TaskDraft(priority = Priority.HIGH)),
+            parser.parse("high", ParseContext(draft = withDuration))
+        )
+        // With nothing pending, a bare "high" is not a command.
+        assertTrue(parser.parse("high", ParseContext()) is TaskCommand.Unsupported)
+    }
 }

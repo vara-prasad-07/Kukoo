@@ -1,5 +1,6 @@
 package com.example.kukoo
 
+import com.example.kukoo.domain.OverlapAck
 import com.example.kukoo.domain.Task
 import com.example.kukoo.domain.TaskStore
 import java.time.Clock
@@ -47,6 +48,16 @@ class FakeStore(initial: List<Task> = emptyList()) : TaskStore {
         rows[task.id] = task
     }
 
-    override fun delete(id: Long): Boolean = rows.remove(id) != null
-    override fun deleteAll() = rows.clear()
+    override fun delete(id: Long): Boolean {
+        ackSet.removeAll { it.aId == id || it.bId == id }
+        return rows.remove(id) != null
+    }
+    override fun deleteAll() {
+        rows.clear()
+        ackSet.clear()
+    }
+
+    private val ackSet = mutableSetOf<OverlapAck>()
+    override fun acks(): Set<OverlapAck> = ackSet.toSet()
+    override fun addAck(ack: OverlapAck) { ackSet += ack }
 }

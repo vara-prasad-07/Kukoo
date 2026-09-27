@@ -29,7 +29,7 @@ sealed interface DeadlineSpec {
 sealed interface TaskRef {
     data class ById(val id: Long) : TaskRef
     data class ByTitle(val query: String) : TaskRef
-    /** "Change the deadline to 6 PM" — the task most recently talked about. */
+    /** "Change the time to 6 PM" — the task most recently talked about. */
     data object Last : TaskRef
 }
 
@@ -44,14 +44,26 @@ data class TaskPatch(
     /** Blank clears the notes. */
     val notes: String? = null,
     val reminderMin: Int? = null,
-    val clearReminder: Boolean = false
+    val clearReminder: Boolean = false,
+    /** The user has seen the overlap this edit causes and wants it anyway. */
+    val keepOverlaps: Boolean = false
 ) {
     val isEmpty: Boolean
         get() = title == null && deadline == null && !clearDeadline && durationMin == null && priority == null &&
-            recurrence == null && notes == null && reminderMin == null && !clearReminder
+            recurrence == null && notes == null && reminderMin == null && !clearReminder && !keepOverlaps
 }
 
 enum class QueryScope { TODAY, ALL_OPEN }
+
+/** How the user answered "use that, pick another time, or keep both?". */
+enum class ConflictChoice {
+    /** Yes: use the time the assistant suggested. */
+    ACCEPT,
+    /** Keep both / that time is right: leave things as they are and stop asking. */
+    KEEP,
+    /** No, not that: the assistant asks for another time. */
+    DECLINE
+}
 
 /** The kinds of non-task talk the assistant recognises and answers naturally. */
 enum class ChatKind {
@@ -85,7 +97,9 @@ sealed interface TaskCommand {
         val recurrence: Recurrence = Recurrence.NONE,
         val notes: String? = null,
         /** Minutes before the deadline to phone about this task; null for no reminder. */
-        val reminderMin: Int? = null
+        val reminderMin: Int? = null,
+        /** The user has seen that this overlaps other tasks and wants it anyway ("keep both"). */
+        val keepOverlaps: Boolean = false
     ) : TaskCommand
 
     /**
@@ -106,6 +120,15 @@ sealed interface TaskCommand {
     data class ReopenTask(val ref: TaskRef) : TaskCommand
     data class DeleteTask(val ref: TaskRef) : TaskCommand
     data class Replan(val scope: PlanScope) : TaskCommand
+
+    /** "Any conflicts?": lists the overlaps and offers to fix the first. */
+    data object CheckConflicts : TaskCommand
+
+    /** "When am I free?" / "when can I fit an hour?": the next free slot. */
+    data class FindTime(val durationMin: Int? = null) : TaskCommand
+
+    /** The answer to a question about an overlap (or an odd start time) the assistant just asked. */
+    data class Resolve(val choice: ConflictChoice) : TaskCommand
     /** Pushes every overdue and due-today open task back by [minutes]. */
     data class Snooze(val minutes: Int = 15) : TaskCommand
 
@@ -167,3 +190,24 @@ data class EngineResult(
 ) {
     val isSuccess: Boolean get() = outcome == Outcome.OK
 }
+
+/** What a question the assistant just asked about a conflict is about. */
+enum class QuestionKind {
+    /** The task overlaps another: use the suggested time, pick another, or keep both. */
+    OVERLAP,
+    /** The start time is in the middle of the night, so probably a misheard AM/PM. */
+    ODD_HOUR,
+    /** A task has no start time and the assistant suggested one. */
+    SCHEDULE
+}
+
+/**
+ * The open question, as the parser needs to see it: a plain "yes" or "no" only means something once it
+ * is known what was asked. [forDraft] is true while a new task is still being set up.
+ */
+data class ConflictQuestion(
+    val kind: QuestionKind,
+    val hasSuggestion: Boolean,
+    val forDraft: Boolean,
+    val taskTitle: String
+)

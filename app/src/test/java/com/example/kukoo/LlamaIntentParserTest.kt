@@ -4,10 +4,14 @@ import com.example.kukoo.ai.Grounding
 import com.example.kukoo.ai.LlamaEngine
 import com.example.kukoo.ai.LlamaIntentParser
 import com.example.kukoo.ai.ParseContext
+import com.example.kukoo.ai.LlamaGrammar
+import com.example.kukoo.domain.ConflictChoice
+import com.example.kukoo.domain.ConflictQuestion
 import com.example.kukoo.domain.DayRef
 import com.example.kukoo.domain.DeadlineSpec
 import com.example.kukoo.domain.Priority
 import com.example.kukoo.domain.QueryScope
+import com.example.kukoo.domain.QuestionKind
 import com.example.kukoo.domain.TaskCommand
 import com.example.kukoo.domain.TaskDraft
 import com.example.kukoo.domain.TaskPatch
@@ -428,5 +432,88 @@ class LlamaIntentParserTest {
         assertTrue(Grounding.noReminderGrounded("remove the reminder", bare = false))
         assertEquals(2, Grounding.durationPhraseCount("30 minutes and 10 minutes before"))
         assertEquals(1, Grounding.durationPhraseCount("remind me an hour before at 6 am"))
+    }
+
+    // ---- answering a question about a conflict ---------------------------------------------------
+
+    private val overlapAsked = ConflictQuestion(QuestionKind.OVERLAP, hasSuggestion = true, forDraft = true, taskTitle = "Call mom")
+    private val moveOffered = ConflictQuestion(QuestionKind.OVERLAP, hasSuggestion = true, forDraft = false, taskTitle = "Dentist")
+
+    @Test
+    fun yesNoAndKeepBoth_areDecidedByRules_notByTheModel() {
+        val ctx = ParseContext(draft = withDuration, conflict = overlapAsked)
+        // The model is deliberately wrong every time: a small model has answered "no" by cancelling the task.
+        val wrong = """{"action":"discard_task"}"""
+        assertEquals(TaskCommand.Resolve(ConflictChoice.ACCEPT), parse("yes", wrong, ctx))
+        assertEquals(TaskCommand.Resolve(ConflictChoice.KEEP), parse("keep both", wrong, ctx))
+        assertEquals(TaskCommand.Resolve(ConflictChoice.KEEP), parse("it's fine", wrong, ctx))
+        assertEquals(TaskCommand.Resolve(ConflictChoice.DECLINE), parse("no", wrong, ctx))
+        assertEquals(TaskCommand.Resolve(ConflictChoice.ACCEPT), parse("yes please", """{"action":"unsupported"}""", ctx))
+    }
+
+    @Test
+    fun theAnswer_isUnderstood_evenBeforeTheModelHasLoaded() {
+        val ctx = ParseContext(draft = withDuration, conflict = overlapAsked)
+        assertEquals(TaskCommand.Resolve(ConflictChoice.KEEP), parse("keep both", "", ctx, available = false))
+        // Anything that is not one of those answers still needs the model.
+        assertEquals(TaskCommand.NotReady, parse("at six", "", ctx, available = false))
+    }
+
+    @Test
+    fun cancel_dropsTheTaskBeingSetUp_butAfterAnOfferItJustLeavesTheChange() {
+        assertEquals(TaskCommand.DiscardDraft, parse("cancel", "", ParseContext(draft = withDuration, conflict = overlapAsked)))
+        assertEquals(TaskCommand.Resolve(ConflictChoice.KEEP), parse("never mind", "", ParseContext(conflict = moveOffered)))
+    }
+
+    @Test
+    fun aNewTime_isTheAnswer_evenAsABareHour_whileAnOverlapIsOpen() {
+        // Priority is the next missing detail, yet what the user says now is a start time.
+        val ctx = ParseContext(draft = withDuration, conflict = overlapAsked)
+        assertEquals(
+            TaskCommand.FillTask(TaskDraft(deadline = rel(h = 18))),
+            parse("six", """{"action":"answer","time":"06:00"}""", ctx)
+        )
+    }
+
+    @Test
+    fun aNewLength_isTheAnswer_whileAnOverlapIsOpen() {
+        val ctx = ParseContext(draft = withDuration, conflict = overlapAsked)
+        assertEquals(
+            TaskCommand.FillTask(TaskDraft(durationMin = 15)),
+            parse("make it 15 minutes", """{"action":"answer","duration_min":15}""", ctx)
+        )
+    }
+
+    @Test
+    fun afterAnOffer_aBareHourIsTheNewTimeForThatTask() {
+        val ctx = ParseContext(openTaskTitles = listOf("Dentist"), conflict = moveOffered)
+        assertEquals(
+            TaskCommand.UpdateTask(TaskRef.ByTitle("Dentist"), TaskPatch(deadline = rel(h = 19))),
+            parse("seven", """{"action":"update_task","target":"Dentist","time":"07:00"}""", ctx)
+        )
+    }
+
+    @Test
+    fun thePrompt_explainsWhatWasJustAskedAboutTheConflict() {
+        val llama = LlamaIntentParser(ScriptedEngine(""))
+        val draftPrompt = llama.buildPrompt("six", ParseContext(draft = withDuration, conflict = overlapAsked))
+        assertTrue(draftPrompt.contains("overlaps another task"))
+        assertTrue(draftPrompt.contains("The assistant just asked the user for the task's start time"))
+        val offerPrompt = llama.buildPrompt("seven", ParseContext(conflict = moveOffered))
+        assertTrue(offerPrompt.contains("\"Dentist\""))
+        assertFalse("no draft is open", offerPrompt.contains("A new task is being set up."))
+    }
+
+    @Test
+    fun asking_aboutConflictsAndFreeTime_isUnderstood() {
+        assertEquals(TaskCommand.CheckConflicts, parse("any conflicts", """{"action":"check_conflicts"}"""))
+        assertEquals(TaskCommand.FindTime(60), parse("when can I fit an hour", """{"action":"find_time","duration_min":60}"""))
+        assertEquals(TaskCommand.FindTime(null), parse("when am I free", """{"action":"find_time"}"""))
+    }
+
+    @Test
+    fun theGrammar_allowsTheNewActions() {
+        assertTrue(LlamaGrammar.COMMAND_JSON.contains("check_conflicts"))
+        assertTrue(LlamaGrammar.COMMAND_JSON.contains("find_time"))
     }
 }

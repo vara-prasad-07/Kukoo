@@ -1,6 +1,5 @@
 package com.example.kukoo
 
-import com.example.kukoo.domain.ConflictKind
 import com.example.kukoo.domain.DayRef
 import com.example.kukoo.domain.DeadlineResolver
 import com.example.kukoo.domain.DeadlineSpec
@@ -56,7 +55,7 @@ class TaskEngineTest {
             createdAt = 0, recurrence = Recurrence.DAILY, notes = "Room 4")))
         val res = r.run(TaskCommand.CompleteTask(title("standup")))
         assertEquals(Outcome.OK, res.outcome)
-        assertEquals("Done. I marked Standup as done. The next one is due tomorrow at 4 PM.", res.spoken)
+        assertEquals("Done. I marked Standup as done. The next one starts tomorrow at 4 PM.", res.spoken)
         val all = r.store.all()
         assertEquals(2, all.size)
         val next = all.first { !it.isDone }
@@ -262,7 +261,7 @@ class TaskEngineTest {
             TaskCommand.AddTask("finish the report", DeadlineSpec.Relative(DayRef.Tomorrow, LocalTime.of(17, 0)))
         )
         assertEquals(Outcome.OK, res.outcome)
-        assertEquals("Added Finish the report, due tomorrow at 5 PM, 30 minutes.", res.spoken)
+        assertEquals("Added Finish the report, starting tomorrow at 5 PM, 30 minutes.", res.spoken)
         val saved = r.byTitle("Finish the report")
         assertEquals(tomorrow(17), saved.deadline)
         assertEquals(Priority.MEDIUM, saved.priority)
@@ -273,7 +272,7 @@ class TaskEngineTest {
     fun add_withoutDeadline_sayssoAndKeepsMixedCaseTitles() {
         val r = rig(emptyList())
         val res = r.run(TaskCommand.AddTask("Call iPhone repair", durationMin = 15, priority = Priority.HIGH))
-        assertEquals("Added Call iPhone repair, with no deadline, 15 minutes.", res.spoken)
+        assertEquals("Added Call iPhone repair, with no start time, 15 minutes.", res.spoken)
         assertNull(r.store.all().single().deadline)
     }
 
@@ -282,7 +281,7 @@ class TaskEngineTest {
         val r = rig(emptyList())
         val res = r.run(TaskCommand.AddTask("call mom", DeadlineSpec.Relative(DayRef.Today, LocalTime.of(9, 0))))
         assertEquals(Outcome.OK, res.outcome)
-        assertEquals("Added Call mom, due tomorrow at 9 AM, 30 minutes.", res.spoken)
+        assertEquals("Added Call mom, starting tomorrow at 9 AM, 30 minutes.", res.spoken)
         assertEquals(tomorrow(9), r.store.all().single().deadline)
     }
 
@@ -360,7 +359,7 @@ class TaskEngineTest {
         r.run(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(today(18)), durationMin = 60, priority = Priority.HIGH, reminderMin = 30))
         r.run(TaskCommand.AddTask("Laundry", DeadlineSpec.Exact(today(19))))
         val briefing = r.engine.taskBriefing(r.byTitle("Gym").id)!!
-        assertTrue(briefing, briefing.startsWith("Reminder: Gym is due today at 6 PM, in 3 hours."))
+        assertTrue(briefing, briefing.startsWith("Reminder: Gym starts today at 6 PM, in 3 hours."))
         assertTrue(briefing, briefing.contains("1 hour, high priority"))
         assertFalse(briefing, briefing.contains("Laundry"))
         r.run(TaskCommand.CompleteTask(TaskRef.ById(r.byTitle("Gym").id)))
@@ -383,7 +382,7 @@ class TaskEngineTest {
     fun move_toTomorrow_keepsTimeOfDay() {
         val r = rig()
         val res = r.run(TaskCommand.UpdateTask(title("client deck"), TaskPatch(deadline = DeadlineSpec.Relative(DayRef.Tomorrow))))
-        assertEquals("Done. Client Deck is now due tomorrow at 5:20 PM.", res.spoken)
+        assertEquals("Done. Client Deck now starts tomorrow at 5:20 PM.", res.spoken)
         assertEquals(tomorrow(17, 20), r.byTitle("Client Deck").deadline)
     }
 
@@ -399,7 +398,7 @@ class TaskEngineTest {
         val r = rig()
         r.run(TaskCommand.UpdateTask(title("client deck"), TaskPatch(deadline = DeadlineSpec.Relative(DayRef.Tomorrow))))
         val res = r.run(TaskCommand.UpdateTask(TaskRef.Last, TaskPatch(deadline = DeadlineSpec.Relative(time = LocalTime.of(18, 0)))))
-        assertEquals("Done. Client Deck is now due tomorrow at 6 PM.", res.spoken)
+        assertEquals("Done. Client Deck now starts tomorrow at 6 PM.", res.spoken)
         assertEquals(tomorrow(18), r.byTitle("Client Deck").deadline)
     }
 
@@ -427,7 +426,7 @@ class TaskEngineTest {
         )
         assertEquals("Updated Client Deck: takes 1 hour 30 minutes, low priority.", res.spoken)
         val cleared = r.run(TaskCommand.UpdateTask(title("client deck"), TaskPatch(clearDeadline = true)))
-        assertEquals("Done. Client Deck no longer has a deadline.", cleared.spoken)
+        assertEquals("Done. Client Deck no longer has a start time.", cleared.spoken)
         assertNull(r.byTitle("Client Deck").deadline)
     }
 
@@ -533,7 +532,7 @@ class TaskEngineTest {
     fun queryToday_listsOpenTasksDueToday_inDeadlineOrder() {
         val r = rig()
         val res = r.run(TaskCommand.QueryTasks(QueryScope.TODAY))
-        assertEquals("You have 2 tasks due today: Follow-up at 4:30 PM and Client Deck at 5:20 PM.", res.spoken)
+        assertEquals("You have 2 tasks today: Follow-up at 4:30 PM and Client Deck at 5:20 PM.", res.spoken)
     }
 
     @Test
@@ -542,7 +541,7 @@ class TaskEngineTest {
         r.run(TaskCommand.CompleteTask(title("client deck")))
         val res = r.run(TaskCommand.QueryTasks(QueryScope.TODAY))
         assertEquals(
-            "1 task is overdue: Send invoice, today at 9 AM. You have 1 task due today: Follow-up at 4:30 PM.",
+            "1 task is past their start time: Send invoice, today at 9 AM. You have 1 task today: Follow-up at 4:30 PM.",
             res.spoken
         )
     }
@@ -550,20 +549,20 @@ class TaskEngineTest {
     @Test
     fun queryToday_whenNothingDue() {
         val r = rig(emptyList())
-        assertEquals("Nothing is due today.", r.run(TaskCommand.QueryTasks(QueryScope.TODAY)).spoken)
+        assertEquals("Nothing is scheduled today.", r.run(TaskCommand.QueryTasks(QueryScope.TODAY)).spoken)
     }
 
     @Test
     fun queryAllOpen_includesNoDeadlineTasks() {
         val r = rig(listOf(Task(title = "Someday", createdAt = 0)))
-        assertEquals("You have 1 open task: Someday, no deadline.", r.run(TaskCommand.QueryTasks(QueryScope.ALL_OPEN)).spoken)
+        assertEquals("You have 1 open task: Someday, no start time.", r.run(TaskCommand.QueryTasks(QueryScope.ALL_OPEN)).spoken)
     }
 
     @Test
     fun briefing_greetsByTimeOfDay_andSumsWorkload() {
         val r = rig()
         assertEquals(
-            "Good afternoon. You have 2 tasks due today: Follow-up at 4:30 PM and Client Deck at 5:20 PM. " +
+            "Good afternoon. You have 2 tasks today: Follow-up at 4:30 PM and Client Deck at 5:20 PM. " +
                 "That is about 1 hour 30 minutes of work. What would you like to do?",
             r.engine.briefing()
         )
@@ -574,21 +573,57 @@ class TaskEngineTest {
     // ---- replanning ----------------------------------------------------------------------
 
     @Test
-    fun replanAfternoon_reportsExactShortfall() {
+    fun replanAfternoon_laysTasksOutAtTheirStartTimes() {
         val r = rig(clock = clockAt(16))
         val res = r.run(TaskCommand.Replan(PlanScope.AFTERNOON))
         val plan = res.plan!!
         assertEquals(listOf("Follow-up", "Client Deck"), plan.blocks.map { it.title })
-        assertEquals(today(16), plan.blocks[0].start)
-        assertEquals(today(16, 30), plan.blocks[1].start)
-        val c = plan.conflicts.single()
-        assertEquals(ConflictKind.LATE, c.kind)
-        assertEquals(10, c.minutes)
+        // A task sits exactly where the user put it: nothing is moved or squeezed.
+        assertEquals(today(16, 30), plan.blocks[0].start)
+        assertEquals(today(17), plan.blocks[0].end)
+        assertEquals(today(17, 20), plan.blocks[1].start)
+        assertTrue(plan.conflicts.isEmpty())
         assertEquals(
-            "Here is your afternoon plan. 4 PM, Follow-up, 30 minutes. 4:30 PM, Client Deck, 1 hour. " +
-                "Conflict: Client Deck finishes 10 minutes after its deadline.",
+            "Here is your afternoon plan. 4:30 PM, Follow-up, 30 minutes. 5:20 PM, Client Deck, 1 hour. No conflicts.",
             res.spoken
         )
+    }
+
+    @Test
+    fun replan_namesTheOverlap_andHowLongItLasts() {
+        val r = rig(
+            listOf(
+                Task(title = "Standup", deadline = today(16), durationMin = 30, createdAt = 0),
+                Task(title = "Dentist", deadline = today(16, 15), durationMin = 45, createdAt = 0)
+            ),
+            clock = clockAt(15)
+        )
+        val res = r.run(TaskCommand.Replan(PlanScope.DAY))
+        val c = res.plan!!.conflicts.single()
+        assertEquals(15, c.minutes)
+        assertEquals(listOf("Dentist"), res.plan!!.blocks.first { it.title == "Standup" }.overlapsWith)
+        assertEquals(
+            "Here is your day plan. 4 PM, Standup, 30 minutes. 4:15 PM, Dentist, 45 minutes. " +
+                "Conflict: Standup and Dentist overlap by 15 minutes, from 4:15 PM to 4:30 PM.",
+            res.spoken
+        )
+    }
+
+    @Test
+    fun replan_suggestsAStartTime_forATaskWithoutOne_inTheFreeTime() {
+        val r = rig(
+            listOf(
+                Task(title = "Standup", deadline = today(15, 30), durationMin = 30, createdAt = 0),
+                Task(title = "Book flights", deadline = null, durationMin = 60, createdAt = 0)
+            ),
+            clock = clockAt(15)
+        )
+        val plan = r.run(TaskCommand.Replan(PlanScope.DAY)).plan!!
+        val suggestion = plan.blocks.single { it.proposed }
+        assertEquals("Book flights", suggestion.title)
+        // 3:00 PM is free for an hour only until 3:30, so it goes after Standup.
+        assertEquals(today(16), suggestion.start)
+        assertEquals(1, r.store.all().count { it.deadline == null })
     }
 
     @Test
@@ -607,18 +642,18 @@ class TaskEngineTest {
     }
 
     @Test
-    fun replan_afterWorkingHours_plansTomorrow_andSaysSo() {
-        val r = rig(clock = clockAt(18, 30))
+    fun replan_afterWakingHours_plansTomorrow_andSaysSo() {
+        val r = rig(clock = clockAt(23))
         val res = r.run(TaskCommand.Replan(PlanScope.DAY))
         assertEquals(TOMORROW, res.plan!!.date)
         assertTrue(res.spoken.startsWith("Here is your day plan for tomorrow."))
-        assertEquals(millis(TOMORROW, 9), res.plan!!.blocks.first().start)
+        assertEquals(millis(TOMORROW, 11), res.plan!!.blocks.first().start)
     }
 
     @Test
     fun replan_withNothingToDo() {
         val r = rig(emptyList())
-        assertEquals("There is nothing to schedule in your day.", r.run(TaskCommand.Replan(PlanScope.DAY)).spoken)
+        assertEquals("There is nothing scheduled in your day.", r.run(TaskCommand.Replan(PlanScope.DAY)).spoken)
     }
 
     // ---- misc ----------------------------------------------------------------------------

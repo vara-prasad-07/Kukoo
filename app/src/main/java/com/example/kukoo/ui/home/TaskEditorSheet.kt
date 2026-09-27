@@ -15,6 +15,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Event
 import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -49,8 +50,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import com.example.kukoo.domain.ConflictDetector
+import com.example.kukoo.domain.DeadlineResolver
+import com.example.kukoo.domain.OverlapAck
+import com.example.kukoo.domain.PlannerConfig
 import com.example.kukoo.domain.Priority
 import com.example.kukoo.domain.Recurrence
+import com.example.kukoo.domain.SlotFinder
 import com.example.kukoo.domain.Task
 import com.example.kukoo.domain.TimeFormat
 import com.example.kukoo.ui.EditorState
@@ -71,6 +77,8 @@ fun TaskEditorSheet(
     editor: EditorState,
     format: TimeFormat,
     clock: Clock,
+    tasks: List<Task>,
+    acks: Set<OverlapAck>,
     onSave: (
         title: String,
         deadline: Long?,
@@ -78,7 +86,8 @@ fun TaskEditorSheet(
         priority: Priority,
         notes: String?,
         recurrence: Recurrence,
-        reminderMin: Int?
+        reminderMin: Int?,
+        keepOverlaps: Boolean
     ) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -102,6 +111,21 @@ fun TaskEditorSheet(
     fun rings(minutes: Int): Long? = Task.reminderTime(deadline, minutes)
     val reminderChanged = existing == null || reminder != existing.reminderMin || deadline != existing.deadline
     val reminderClash = reminderChanged && reminder?.let { m -> rings(m)?.let { it <= now } } == true
+
+    // The task runs from its start time for its duration; any other open task sharing that time is a clash.
+    // Checked as the fields change, so it is seen before saving rather than after.
+    val detector = remember(clock) { ConflictDetector(DeadlineResolver(clock)) }
+    val finder = remember(clock) { SlotFinder(PlannerConfig(), DeadlineResolver(clock)) }
+    val candidate = deadline?.let {
+        Task(
+            id = existing?.id ?: -1L, title = title, deadline = it, durationMin = duration,
+            priority = priority, createdAt = now, recurrence = recurrence
+        )
+    }
+    val clashes = candidate?.let { detector.overlapsWith(tasks, it, now, acks) }.orEmpty()
+    val clashNames = clashes.map { it.other(candidate!!.id) }.distinctBy { it.task.id }
+    val suggestion = if (clashes.isEmpty() || candidate == null) null else finder.suggestFor(tasks, candidate, now, detector)
+    val middleOfTheNight = deadline?.let { Instant.ofEpochMilli(it).atZone(zone).hour < PlannerConfig().oddHourEndHour } == true
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -128,10 +152,10 @@ fun TaskEditorSheet(
                 modifier = Modifier.fillMaxWidth()
             )
 
-            Field("Deadline") {
+            Field("Start time") {
                 val current = deadline
                 if (current == null) {
-                    OutlinedButton(onClick = { deadline = defaultDeadline(clock) }) { Text("Add deadline") }
+                    OutlinedButton(onClick = { deadline = defaultDeadline(clock) }) { Text("Add start time") }
                 } else {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         AssistChip(
@@ -145,7 +169,7 @@ fun TaskEditorSheet(
                             leadingIcon = { Icon(Icons.Default.Schedule, contentDescription = null) }
                         )
                         IconButton(onClick = { deadline = null; reminder = null }) {
-                            Icon(Icons.Default.Close, contentDescription = "Remove deadline")
+                            Icon(Icons.Default.Close, contentDescription = "Remove start time")
                         }
                     }
                 }
@@ -155,7 +179,7 @@ fun TaskEditorSheet(
                 val due = deadline
                 if (due == null) {
                     Text(
-                        "Add a deadline to get a call before it.",
+                        "Add a start time to get a call before it starts.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -184,7 +208,7 @@ fun TaskEditorSheet(
                     if (reminderClash) {
                         Text(
                             "That call would ring at ${format.clockTime(rings(reminder!!)!!)}, which has already passed. " +
-                                "Pick a shorter reminder or a later deadline.",
+                                "Pick a shorter reminder or a later start time.",
                             color = MaterialTheme.colorScheme.error,
                             style = MaterialTheme.typography.bodyMedium
                         )
@@ -205,6 +229,33 @@ fun TaskEditorSheet(
                         )
                     }
                 }
+            }
+
+            if (clashNames.isNotEmpty()) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                        Text(
+                            "  Overlaps " + clashNames.joinToString(", ") {
+                                "${it.task.title} (${format.clockTime(it.start)} to ${format.clockTime(it.end)})"
+                            },
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                    suggestion?.let { slot ->
+                        OutlinedButton(onClick = { deadline = slot }) {
+                            Text("Move to ${format.day(slot)} ${format.clockTime(slot)}")
+                        }
+                    }
+                }
+            }
+            if (middleOfTheNight) {
+                Text(
+                    "That is in the middle of the night. Check that it is AM you meant.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodyMedium
+                )
             }
 
             Field("Priority") {
@@ -258,11 +309,13 @@ fun TaskEditorSheet(
                     onClick = {
                         onSave(
                             title, deadline, duration, priority, notes.ifBlank { null }, recurrence,
-                            if (deadline == null) null else reminder
+                            if (deadline == null) null else reminder,
+                            // Saving over a clash the user has just seen is a decision, so it is remembered.
+                            clashNames.isNotEmpty()
                         )
                     },
                     enabled = title.isNotBlank() && !reminderClash
-                ) { Text("Save") }
+                ) { Text(if (clashNames.isNotEmpty()) "Save anyway" else "Save") }
             }
         }
     }
@@ -286,7 +339,7 @@ fun TaskEditorSheet(
                 OutlinedTextField(
                     value = text,
                     onValueChange = { if (it.length <= 4 && it.all(Char::isDigit)) text = it },
-                    label = { Text("Minutes before the deadline") },
+                    label = { Text("Minutes before the start time") },
                     singleLine = true,
                     isError = problem != null,
                     supportingText = problem?.let { message -> { Text(message) } },

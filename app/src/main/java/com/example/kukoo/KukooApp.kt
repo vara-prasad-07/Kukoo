@@ -17,7 +17,7 @@ import com.example.kukoo.ai.SpeechToText
 import com.example.kukoo.call.CallScheduler
 import com.example.kukoo.data.DemoData
 import com.example.kukoo.data.SqliteTaskStore
-import com.example.kukoo.domain.OfficeKitReplanner
+import com.example.kukoo.domain.LocalReplanner
 import com.example.kukoo.domain.TaskEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -60,7 +60,7 @@ class AppContainer(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     val store = SqliteTaskStore(appContext)
-    val engine = TaskEngine(store, OfficeKitReplanner(), clock)
+    val engine = TaskEngine(store, LocalReplanner(), clock)
 
     /** Download state for the speech models; the LLM bundle is managed by GenieX itself. */
     val models = ModelRepository(appContext)

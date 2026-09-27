@@ -10,7 +10,10 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performSemanticsAction
 import com.example.kukoo.domain.PlanScope
-import com.example.kukoo.domain.Planner
+import com.example.kukoo.domain.Conflict
+import com.example.kukoo.domain.Plan
+import com.example.kukoo.domain.PlanSource
+import com.example.kukoo.domain.ScheduledBlock
 import com.example.kukoo.domain.Priority
 import com.example.kukoo.domain.Task
 import com.example.kukoo.domain.TaskStatus
@@ -115,7 +118,7 @@ class ScreenshotTest {
         home(dark = false)
         rule.onNodeWithText("Your tasks").assertExists()
         rule.onNodeWithText("Client Deck").assertExists()
-        rule.onNodeWithText("OVERDUE").assertExists()
+        rule.onNodeWithText("PAST START TIME").assertExists()
         rule.onNodeWithText("Talk to Kukoo").assertExists()
         rule.onNodeWithText("Daily call at 9 AM").assertExists()
         shot("1_home_light")
@@ -161,9 +164,9 @@ class ScreenshotTest {
     fun voiceSession() {
         val session = SessionState(
             turns = listOf(
-                Turn(1, false, "Good afternoon. You have 2 tasks due today: Follow-up at 4:30 PM and Client Deck at 5:20 PM. That is about 1 hour 30 minutes of work. What would you like to do?"),
+                Turn(1, false, "Good afternoon. You have 2 tasks today: Follow-up at 4:30 PM and Client Deck at 5:20 PM. That is about 1 hour 30 minutes of work. What would you like to do?"),
                 Turn(2, true, "Move the client deck to tomorrow"),
-                Turn(3, false, "Done. Client Deck is now due tomorrow at 5:20 PM.", Outcome.OK),
+                Turn(3, false, "Done. Client Deck now starts tomorrow at 5:20 PM.", Outcome.OK),
                 Turn(4, true, "Delete the payroll task"),
                 Turn(5, false, "I couldn't find a task called payroll.", Outcome.REJECTED)
             ),
@@ -182,20 +185,19 @@ class ScreenshotTest {
     }
 
     @Test
-    fun planResult_withConflictSplitAndGap() {
-        val planner = Planner()
-        val plan = planner.plan(
-            tasks = listOf(
-                Task(2, "Follow-up", today(16, 30), 30, Priority.MEDIUM, createdAt = 0),
-                Task(3, "Client Deck", today(17, 20), 60, Priority.HIGH, createdAt = 0),
-                Task(4, "Design Review", today(19), 45, Priority.MEDIUM, createdAt = 0),
-                Task(6, "Write summary", today(19), 90, Priority.LOW, createdAt = 0)
-            ),
-            window = TimeRange(today(12), today(20)),
+    fun planResult_withOverlapAndSuggestion() {
+        val plan = Plan(
             scope = PlanScope.AFTERNOON,
             date = TODAY,
-            now = today(15),
-            fixedBlocks = listOf(TimeRange(today(17, 30), today(18)))
+            blocks = listOf(
+                ScheduledBlock(2, "Follow-up", Priority.MEDIUM, today(16, 30), today(17), overlapsWith = listOf("Client Deck")),
+                ScheduledBlock(3, "Client Deck", Priority.HIGH, today(16, 45), today(17, 45), overlapsWith = listOf("Follow-up")),
+                ScheduledBlock(6, "Write summary", Priority.LOW, today(19), today(20, 30), proposed = true)
+            ),
+            conflicts = listOf(Conflict(2, "Follow-up", 3, "Client Deck", today(16, 45), today(17))),
+            unplaced = listOf("Book flights"),
+            source = PlanSource.LOCAL,
+            generatedAt = today(15)
         )
         themed { PlanScreen(plan, format, doneLabel = "Back to call", onBack = {}) }
         rule.onNodeWithText("Afternoon plan").assertExists()
@@ -206,8 +208,8 @@ class ScreenshotTest {
 
     @Test
     fun planResult_empty() {
-        val plan = Planner().plan(emptyList(), TimeRange(today(9), today(18)), PlanScope.DAY, TODAY, today(9))
+        val plan = Plan(PlanScope.DAY, TODAY, emptyList(), emptyList(), emptyList(), PlanSource.LOCAL, today(9))
         themed { PlanScreen(plan, format, doneLabel = "Done", onBack = {}) }
-        rule.onNodeWithText("There are no open tasks to schedule.").assertExists()
+        rule.onNodeWithText("Nothing is scheduled.").assertExists()
     }
 }

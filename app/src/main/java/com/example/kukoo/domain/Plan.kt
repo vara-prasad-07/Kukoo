@@ -13,66 +13,64 @@ data class TimeRange(val start: Long, val end: Long) {
     val minutes: Int get() = (length / MILLIS_PER_MINUTE).toInt()
 }
 
-/** Where a plan was computed. Only [LOCAL] exists until the Office Kit handoff is built. */
+/** Where a plan was computed. Everything runs on the device. */
 enum class PlanSource(val label: String) {
-    LOCAL("Computed on this device"),
-    OFFICE_KIT("Computed on the laptop (Office Kit)")
+    LOCAL("Computed on this device")
 }
 
-/** One contiguous slot of work. A split task produces several blocks with the same [taskId]. */
+/**
+ * One task on the day's timeline. A task the user scheduled sits at its own start time; a
+ * [proposed] one has no start time yet and is only a suggestion, saved when the user accepts it.
+ * [overlapsWith] names the other tasks this one shares time with.
+ */
 data class ScheduledBlock(
     val taskId: Long,
     val title: String,
     val priority: Priority,
     val start: Long,
     val end: Long,
-    val part: Int,
-    val partCount: Int
+    val proposed: Boolean = false,
+    val overlapsWith: List<String> = emptyList()
 ) {
     val minutes: Int get() = ((end - start) / MILLIS_PER_MINUTE).toInt()
 }
 
-enum class ConflictKind {
-    /** All the work fits but finishes after the deadline. */
-    LATE,
-    /** Part of the work does not fit in the free time at all. */
-    NO_ROOM
-}
-
-/**
- * [minutes] is exact: for [ConflictKind.LATE] the minutes past the deadline (rounded up),
- * for [ConflictKind.NO_ROOM] the minutes of work that could not be placed.
- */
+/** Two tasks whose time overlaps, for [minutes] minutes starting at [start]. */
 data class Conflict(
-    val taskId: Long,
-    val title: String,
-    val kind: ConflictKind,
-    val minutes: Int,
-    val deadline: Long?
-)
+    val firstId: Long,
+    val firstTitle: String,
+    val secondId: Long,
+    val secondTitle: String,
+    val start: Long,
+    val end: Long
+) {
+    val minutes: Int get() = ((end - start + MILLIS_PER_MINUTE - 1) / MILLIS_PER_MINUTE).toInt()
+    fun involves(taskId: Long) = firstId == taskId || secondId == taskId
+}
 
 data class Plan(
     val scope: PlanScope,
     val date: LocalDate,
-    val window: TimeRange,
     val blocks: List<ScheduledBlock>,
     val conflicts: List<Conflict>,
+    /** Tasks without a start time that there was no free room for on this day. */
+    val unplaced: List<String>,
     val source: PlanSource,
     val generatedAt: Long
 ) {
-    val isEmpty: Boolean get() = blocks.isEmpty() && conflicts.isEmpty()
+    val isEmpty: Boolean get() = blocks.isEmpty() && conflicts.isEmpty() && unplaced.isEmpty()
     val totalMinutes: Int get() = blocks.sumOf { it.minutes }
-    fun conflictFor(taskId: Long): Conflict? = conflicts.firstOrNull { it.taskId == taskId }
 }
 
 data class PlannerConfig(
-    val workStartHour: Int = 9,
-    val workEndHour: Int = 18,
+    /** Slots and "did you mean" checks use the hours the user is awake. */
+    val awakeStartHour: Int = 7,
+    val awakeEndHour: Int = 23,
+    /** A start before this hour (0:00 to 4:59) is almost always a misheard AM/PM, so it is confirmed. */
+    val oddHourEndHour: Int = 5,
     val afternoonStartHour: Int = 12,
-    /** Smallest slice a task may be split into. */
-    val minChunkMin: Int = 25,
-    /** Plans start on the next multiple of this many minutes. */
+    /** Suggested start times land on a multiple of this many minutes. */
     val slotMin: Int = 5,
-    /** Deadline time used when only a day is given ("move it to tomorrow" on a task with no time). */
+    /** Start time used when only a day is given ("move it to tomorrow" on a task with no time). */
     val defaultDeadlineHour: Int = 18
 )

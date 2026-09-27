@@ -41,7 +41,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import com.example.kukoo.domain.Conflict
-import com.example.kukoo.domain.ConflictKind
 import com.example.kukoo.domain.MILLIS_PER_MINUTE
 import com.example.kukoo.domain.Plan
 import com.example.kukoo.domain.ScheduledBlock
@@ -119,20 +118,30 @@ fun PlanScreen(
             if (plan.isEmpty) {
                 item(key = "empty") {
                     Text(
-                        "There are no open tasks to schedule.",
+                        "Nothing is scheduled.",
                         style = MaterialTheme.typography.bodyLarge,
                         modifier = Modifier.padding(vertical = 32.dp)
                     )
                 }
             }
 
-            itemsIndexed(plan.blocks, key = { i, b -> "${b.taskId}-${b.part}-$i" }) { index, block ->
+            if (plan.unplaced.isNotEmpty()) {
+                item(key = "unplaced") {
+                    Text(
+                        "No room today for " + plan.unplaced.joinToString(", ") + ".",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(bottom = 12.dp)
+                    )
+                }
+            }
+
+            itemsIndexed(plan.blocks, key = { i, b -> "${b.taskId}-${b.start}-$i" }) { index, block ->
                 val previous = plan.blocks.getOrNull(index - 1)
                 val gapMinutes = previous?.let { ((block.start - it.end) / MILLIS_PER_MINUTE).toInt() } ?: 0
                 if (gapMinutes > 0) FreeGap(gapMinutes)
                 BlockRow(
                     block = block,
-                    conflict = plan.conflictFor(block.taskId)?.takeIf { block.part == block.partCount },
                     format = format,
                     isLast = index == plan.blocks.lastIndex
                 )
@@ -166,13 +175,9 @@ private fun ConflictCard(conflicts: List<Conflict>, format: TimeFormat) {
     }
 }
 
-private fun conflictText(c: Conflict, format: TimeFormat): String {
-    val deadline = c.deadline?.let { " (deadline ${format.clockTime(it)})" }.orEmpty()
-    return when (c.kind) {
-        ConflictKind.LATE -> "${c.title} finishes ${format.minutes(c.minutes)} after its deadline$deadline."
-        ConflictKind.NO_ROOM -> "${c.title}: ${format.minutes(c.minutes)} can't be scheduled in the free time$deadline."
-    }
-}
+private fun conflictText(c: Conflict, format: TimeFormat): String =
+    "${c.firstTitle} and ${c.secondTitle} overlap by ${format.minutes(c.minutes)}, " +
+        "from ${format.clockTime(c.start)} to ${format.clockTime(c.end)}."
 
 @Composable
 private fun FreeGap(minutes: Int) {
@@ -187,7 +192,7 @@ private fun FreeGap(minutes: Int) {
 }
 
 @Composable
-private fun BlockRow(block: ScheduledBlock, conflict: Conflict?, format: TimeFormat, isLast: Boolean) {
+private fun BlockRow(block: ScheduledBlock, format: TimeFormat, isLast: Boolean) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -226,28 +231,25 @@ private fun BlockRow(block: ScheduledBlock, conflict: Conflict?, format: TimeFor
         Card(
             shape = RoundedCornerShape(14.dp),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            border = BorderStroke(1.dp, if (conflict != null) Danger.copy(alpha = 0.6f) else MaterialTheme.colorScheme.outline),
+            border = BorderStroke(1.dp, if (block.overlapsWith.isNotEmpty()) Danger.copy(alpha = 0.6f) else MaterialTheme.colorScheme.outline),
             modifier = Modifier
                 .weight(1f)
                 .padding(bottom = 8.dp)
         ) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(block.title, style = MaterialTheme.typography.titleMedium)
-                val part = if (block.partCount > 1) " · part ${block.part} of ${block.partCount}" else ""
+                val suggested = if (block.proposed) " · suggested time" else ""
                 Text(
-                    shortDuration(block.minutes) + part,
+                    shortDuration(block.minutes) + suggested,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                if (conflict != null) {
+                if (block.overlapsWith.isNotEmpty()) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.Warning, contentDescription = null, tint = Danger, modifier = Modifier.size(14.dp))
                         Spacer(Modifier.width(4.dp))
                         Text(
-                            when (conflict.kind) {
-                                ConflictKind.LATE -> "Ends ${format.minutes(conflict.minutes)} after deadline"
-                                ConflictKind.NO_ROOM -> "${format.minutes(conflict.minutes)} won't fit"
-                            },
+                            "Overlaps " + block.overlapsWith.distinct().joinToString(", "),
                             style = MaterialTheme.typography.labelMedium,
                             color = Danger
                         )

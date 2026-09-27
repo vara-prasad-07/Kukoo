@@ -145,8 +145,10 @@ fun KukooRoot(vm: KukooViewModel) {
                 editor = editor,
                 format = vm.format,
                 clock = vm.clock,
-                onSave = { title, deadline, duration, priority, notes, recurrence, reminder ->
-                    vm.saveEditor(title, deadline, duration, priority, notes, recurrence, reminder)
+                tasks = state.tasks,
+                acks = state.acks,
+                onSave = { title, deadline, duration, priority, notes, recurrence, reminder, keepOverlaps ->
+                    vm.saveEditor(title, deadline, duration, priority, notes, recurrence, reminder, keepOverlaps)
                 },
                 onDismiss = vm::closeEditor
             )

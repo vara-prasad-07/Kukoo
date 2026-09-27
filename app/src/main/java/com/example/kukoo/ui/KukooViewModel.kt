@@ -173,12 +173,13 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
         priority: Priority,
         notes: String? = null,
         recurrence: Recurrence = Recurrence.NONE,
-        reminderMin: Int? = null
+        reminderMin: Int? = null,
+        keepOverlaps: Boolean = false
     ) {
         val editing = _state.value.editor?.task
         val spec = deadline?.let { DeadlineSpec.Exact(it) }
         val command = if (editing == null) {
-            TaskCommand.AddTask(title, spec, durationMin, priority, recurrence, notes, reminderMin)
+            TaskCommand.AddTask(title, spec, durationMin, priority, recurrence, notes, reminderMin, keepOverlaps)
         } else {
             TaskCommand.UpdateTask(
                 TaskRef.ById(editing.id),
@@ -192,7 +193,8 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
                     // Blank notes clear them (a null patch field would mean "leave as is").
                     notes = notes ?: "",
                     reminderMin = reminderMin,
-                    clearReminder = reminderMin == null
+                    clearReminder = reminderMin == null,
+                    keepOverlaps = keepOverlaps
                 )
             )
         }
@@ -653,7 +655,7 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
                     .map { ConversationTurn(it.fromUser, it.text) }
                 val parsed = container.parser.parse(
                     text,
-                    ParseContext(openTitles, engine.pendingDraft, recent),
+                    ParseContext(openTitles, engine.pendingDraft, recent, engine.pendingConflict),
                 )
                 command = parsed
                 engine.executeSpoken(parsed).also { result ->
@@ -769,9 +771,9 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
         val days = java.time.temporal.ChronoUnit.DAYS.between(today, java.time.Instant.ofEpochMilli(plusHour).atZone(zone).toLocalDate())
         if (plusHour > clock.millis() && days in 0..6) {
             val day = format.day(plusHour)
-            actions += QuickAction("+1 Hour", "change the deadline to $day at ${format.clockTime(plusHour).lowercase()}")
+            actions += QuickAction("+1 Hour", "change the time to $day at ${format.clockTime(plusHour).lowercase()}")
         }
-        actions += QuickAction("Tomorrow 9 AM", "change the deadline to tomorrow at 9 am")
+        actions += QuickAction("Tomorrow 9 AM", "change the time to tomorrow at 9 am")
         actions += QuickAction("Snooze 15m", "snooze 15 minutes")
         return actions
     }
@@ -786,7 +788,7 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
         // Every add, edit, completion, delete and undo lands here, so the reminder alarms follow along.
         runCatching { container.scheduler.syncReminders(tasks) }
             .onFailure { Log.w(TAG, "Could not schedule task reminders", it) }
-        _state.update { it.copy(tasks = tasks, loaded = true) }
+        _state.update { it.copy(tasks = tasks, acks = container.store.acks(), loaded = true) }
     }
 
     private suspend fun safely(block: suspend () -> Unit) {

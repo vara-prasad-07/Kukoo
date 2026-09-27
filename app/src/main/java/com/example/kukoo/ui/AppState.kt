@@ -1,6 +1,7 @@
 package com.example.kukoo.ui
 
 import com.example.kukoo.domain.Outcome
+import com.example.kukoo.domain.OverlapAck
 import com.example.kukoo.domain.Plan
 import com.example.kukoo.domain.Task
 
@@ -68,6 +69,8 @@ data class SetupState(
 data class AppState(
     val screen: Screen = Screen.HOME,
     val tasks: List<Task> = emptyList(),
+    /** Overlaps the user chose to keep, so the screens do not warn about them. */
+    val acks: Set<OverlapAck> = emptySet(),
     val loaded: Boolean = false,
     val session: SessionState = SessionState(),
     val plan: Plan? = null,

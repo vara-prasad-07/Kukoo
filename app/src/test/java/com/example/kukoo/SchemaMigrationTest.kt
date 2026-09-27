@@ -35,8 +35,12 @@ class SchemaMigrationTest {
         assertEquals("Old task", old.title)
         assertEquals(Recurrence.NONE, old.recurrence)
         assertNull(old.notes)
+        assertNull(old.reminderMin)
 
-        val saved = store.insert(Task(title = "New", createdAt = 1, recurrence = Recurrence.WEEKLY, notes = "n"))
+        val saved = store.insert(
+            Task(title = "New", deadline = 900_000, createdAt = 1, recurrence = Recurrence.WEEKLY, notes = "n", reminderMin = 15)
+        )
+        assertEquals(15, store.get(saved.id)?.reminderMin)
         assertEquals(saved, store.get(saved.id))
         store.close()
     }

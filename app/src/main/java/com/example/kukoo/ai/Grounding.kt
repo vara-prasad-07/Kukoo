@@ -94,6 +94,36 @@ internal object Grounding {
         return durationMarker.containsMatchIn(u) || (bare && anyAmount.containsMatchIn(u))
     }
 
+    private val durationPhrase = Regex(
+        "(?:\\d+(?:\\.\\d+)?\\s*|(?:$bigNumberWords|an?|half|quarter)\\s+)(?:h|hr|hrs|hours?|m|mins?|minutes?)\\b"
+    )
+
+    /** How many separate lengths of time the user named ("30 minutes, 10 minutes before" is two). */
+    fun durationPhraseCount(utterance: String): Int = durationPhrase.findAll(utterance.lowercase(Locale.ROOT)).count()
+
+    private val reminderContext = Regex(
+        "\\b(?:remind\\w*|call me|calling me|ring me|notify|notification|alert|heads[- ]?up|ahead|in advance)\\b|\\bbefore\\b"
+    )
+    private val noWord = Regex("\\b(?:no|none|nope|nah|nothing|skip|without|neither)\\b|\\bdon'?t\\b|\\bnot (?:needed|necessary)\\b")
+    private val removeWord = Regex("\\b(?:remove|delete|cancel|clear|stop|turn off|disable)\\b")
+
+    /**
+     * A number of minutes is a *reminder* only when the user spoke of one ("remind me 10 minutes before"),
+     * or when the assistant had just asked about the reminder, where a bare "10" is the answer ([bare]).
+     */
+    fun reminderMinutesGrounded(utterance: String, bare: Boolean): Boolean =
+        durationGrounded(utterance, bare) && (bare || reminderContext.containsMatchIn(utterance.lowercase(Locale.ROOT)))
+
+    /**
+     * "No reminder": a plain no-word when the assistant just asked ([bare]); otherwise the user has to
+     * be talking about reminders as well ("no reminder", "remove the reminder from ...").
+     */
+    fun noReminderGrounded(utterance: String, bare: Boolean): Boolean {
+        val u = utterance.lowercase(Locale.ROOT)
+        return if (bare) noWord.containsMatchIn(u)
+        else reminderContext.containsMatchIn(u) && (noWord.containsMatchIn(u) || removeWord.containsMatchIn(u))
+    }
+
     private val priorityWord = Regex(
         "\\b(?:high|medium|low|urgent|urgently|important|critical|asap|normal|moderate|minor|top|mid|regular|" +
             "average|immediately|rush)\\b|\\bnot\\s+(?:that\\s+|very\\s+|so\\s+)?(?:urgent|important)\\b"

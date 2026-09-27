@@ -172,7 +172,7 @@ class ScreenshotTest {
             micReady = false
         )
         var sent: String? = null
-        themed { VoiceSessionScreen(session, clock, onSend = { sent = it }, onMicPress = {}, onMicRelease = {}, onEnd = {}) }
+        themed { VoiceSessionScreen(session, clock, onSend = { sent = it }, onMicTap = {}, onMicPress = {}, onMicRelease = {}, onToggleHandsFree = {}, onEnd = {}) }
         rule.mainClock.advanceTimeBy(1500)
         rule.onNodeWithText("Replan my afternoon").assertExists()
         rule.onNodeWithText("Your turn", substring = true).assertExists()

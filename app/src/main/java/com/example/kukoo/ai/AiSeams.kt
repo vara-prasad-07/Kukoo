@@ -12,8 +12,21 @@ import com.example.kukoo.domain.TaskDraft
  */
 data class ParseContext(
     val openTaskTitles: List<String> = emptyList(),
-    val draft: TaskDraft? = null
-)
+    val draft: TaskDraft? = null,
+    /**
+     * The last few turns, oldest first, so a follow-up can be understood at all: "move it to six"
+     * and "the second one" mean nothing without what was just said.
+     */
+    val history: List<ConversationTurn> = emptyList()
+) {
+    companion object {
+        /** How many past turns the caller should collect; the parser may use fewer. */
+        const val HISTORY_TURNS = 6
+    }
+}
+
+/** One line of the conversation so far, as the model should see it. */
+data class ConversationTurn(val fromUser: Boolean, val text: String)
 
 /**
  * Turns what the user said into one supported [TaskCommand].
@@ -24,12 +37,27 @@ interface IntentParser {
     suspend fun parse(utterance: String, context: ParseContext = ParseContext()): TaskCommand
 }
 
-/** Tap-to-talk speech input: press starts recording, release returns the transcript. */
+/** Hands-free speech input: the recognizer decides when the user has finished talking. */
 interface SpeechToText {
-    /** False until a model is installed; the UI then falls back to typed / tap-to-send input. */
+    /** False until a model is installed and the mic is allowed; the UI then falls back to typed input. */
     val isReady: Boolean
-    suspend fun startListening()
-    suspend fun stopAndTranscribe(): String
+
+    /**
+     * Records one utterance and returns what was said, or "" if nothing was heard.
+     *
+     * Hands-free ([manual] false): waits for the user to speak and stops when they pause.
+     * Push-to-talk ([manual] true): records until [finishUtterance] is called (button released).
+     *
+     * [onCaptured] runs once recording has ended, before the (slower) transcription. Cancelling the
+     * caller releases the microphone.
+     */
+    suspend fun listen(manual: Boolean = false, onCaptured: () -> Unit = {}): String
+
+    /**
+     * Ends the recording now: the button was released, or the user tapped "done". Returns true if a
+     * pending [listen] will now return what was recorded; false if there was nothing to end.
+     */
+    fun finishUtterance(): Boolean = false
 }
 
 /** Speech output. [speak] returns when the utterance has finished (or was stopped). */
@@ -44,7 +72,9 @@ interface Speaker {
  */
 class FallbackSpeaker(private val neural: SherpaSpeaker, private val platform: Speaker) : Speaker {
     override suspend fun speak(text: String) {
-        if (neural.isReady) neural.speak(text) else platform.speak(text)
+        // A voice that is installed but fails to load or play must not leave the assistant mute.
+        if (neural.isReady && neural.trySpeak(text)) return
+        platform.speak(text)
     }
 
     override fun stop() {
@@ -56,8 +86,7 @@ class FallbackSpeaker(private val neural: SherpaSpeaker, private val platform: S
 /** Placeholder until the STT model is chosen and integrated. */
 class UnavailableSpeechToText : SpeechToText {
     override val isReady: Boolean = false
-    override suspend fun startListening() = Unit
-    override suspend fun stopAndTranscribe(): String = ""
+    override suspend fun listen(manual: Boolean, onCaptured: () -> Unit): String = ""
 }
 
 /** Placeholder until the TTS engine is chosen; the transcript still shows every reply. */

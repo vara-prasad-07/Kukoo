@@ -7,9 +7,11 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.kukoo.KukooApp
 import com.example.kukoo.ai.InstallProgress
+import com.example.kukoo.ai.ConversationTurn
 import com.example.kukoo.ai.ParseContext
 import com.example.kukoo.ai.SpeechModel
 import com.geniex.sdk.ModelManagerWrapper
+import com.example.kukoo.call.CallAlarmReceiver
 import com.example.kukoo.call.CallRinger
 import com.example.kukoo.call.IncomingCallNotifier
 import com.example.kukoo.domain.DeadlineSpec
@@ -27,7 +29,9 @@ import com.example.kukoo.domain.TimeFormat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -52,6 +56,9 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
     private val ringer = CallRinger(application)
     private var ringTimeout: Job? = null
 
+    /** Task reminders that came due while another call was ringing or in progress, oldest first. */
+    private val queuedReminders = ArrayDeque<Long>()
+
     val format: TimeFormat get() = engine.format
     val clock: Clock get() = container.clock
 
@@ -64,6 +71,12 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
     private var turnJob: Job? = null
     private var nextTurnId = 1L
 
+    /** Hold-to-talk unless the user turns hands-free on; kept for the life of the app. */
+    private var handsFree = false
+
+    /** The mic only works while the app is visible; see [onAppBackgrounded]. */
+    private var inForeground = true
+
     /** Per-turn diagnostics are for debug builds only: what was heard and how it was understood. */
     private val debuggable = (application.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
@@ -73,7 +86,7 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
             safely { reloadTasks() }
         }
         viewModelScope.launch {
-            container.incomingCalls.collect { onIncomingCall(fromAlarm = true) }
+            container.incomingCalls.collect { onIncomingCall(fromAlarm = true, taskId = it) }
         }
     }
 
@@ -84,7 +97,12 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
         when (_state.value.screen) {
             Screen.HOME -> return false
             Screen.INCOMING_CALL, Screen.SESSION -> endToHome()
-            Screen.PLAN -> _state.update { it.copy(screen = it.planReturnsTo) }
+            Screen.PLAN -> {
+                val returnsTo = _state.value.planReturnsTo
+                _state.update { it.copy(screen = returnsTo) }
+                // The call kept its place; the assistant listens again once the user is back in it.
+                if (returnsTo == Screen.SESSION && _state.value.session.phase == Phase.IDLE) runTurn { }
+            }
             // A download keeps running in the background; leaving the screen does not cancel it.
             Screen.SETUP -> _state.update { it.copy(screen = Screen.HOME) }
         }
@@ -94,8 +112,18 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
     fun onAppBackgrounded() {
         // Leaving the app while it rings counts as a missed call. Over the lock screen the keyguard can
         // stop the activity as the call appears, so that must not drop it; the ring timeout still ends it.
+        inForeground = false
         val s = _state.value
         if (s.screen == Screen.INCOMING_CALL && !s.overLockscreen) endToHome()
+        // Android gives a background app silence from the mic, so stop listening rather than pretend to.
+        if (s.screen == Screen.SESSION && s.session.phase == Phase.LISTENING) pauseListening("Paused while the app was in the background.")
+    }
+
+    /** Back on screen: pick the conversation up again if it was paused only because the app left. */
+    fun onAppForegrounded() {
+        inForeground = true
+        val s = _state.value
+        if (s.screen == Screen.SESSION && s.session.phase == Phase.IDLE) runTurn { }
     }
 
     fun dismissNotice() = _state.update { it.copy(notice = null) }
@@ -144,12 +172,13 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
         durationMin: Int,
         priority: Priority,
         notes: String? = null,
-        recurrence: Recurrence = Recurrence.NONE
+        recurrence: Recurrence = Recurrence.NONE,
+        reminderMin: Int? = null
     ) {
         val editing = _state.value.editor?.task
         val spec = deadline?.let { DeadlineSpec.Exact(it) }
         val command = if (editing == null) {
-            TaskCommand.AddTask(title, spec, durationMin, priority, recurrence, notes)
+            TaskCommand.AddTask(title, spec, durationMin, priority, recurrence, notes, reminderMin)
         } else {
             TaskCommand.UpdateTask(
                 TaskRef.ById(editing.id),
@@ -161,7 +190,9 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
                     priority = priority,
                     recurrence = recurrence,
                     // Blank notes clear them (a null patch field would mean "leave as is").
-                    notes = notes ?: ""
+                    notes = notes ?: "",
+                    reminderMin = reminderMin,
+                    clearReminder = reminderMin == null
                 )
             )
         }
@@ -219,28 +250,37 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
             }
             val llmReady = container.genieX.isModelDownloaded
             val chipset = runCatching { container.genieX.detectChipset() }.getOrNull().orEmpty()
+            // Downloaded is not the same as running: the NPU load needs several GB and fails while
+            // another app holds them. Saying only "Installed" hid that the rule parser was doing
+            // every turn, so the state the user actually cares about is shown instead.
             val llm = ModelRow(
                 id = "LLM",
                 label = "Qwen3-VL-4B-Instruct (NPU)",
-                detail = if (llmReady) "Installed" else "Downloads from Qualcomm AI Hub",
+                detail = when {
+                    container.genieX.isLoaded -> "Installed and running on the NPU"
+                    llmReady -> "Installed — waiting for the NPU to free up. Restarting the phone frees it."
+                    else -> "Downloads from Qualcomm AI Hub"
+                },
                 installed = llmReady,
             )
             _state.update { it.copy(setup = it.setup.copy(speech = speech, llm = llm, chipset = chipset)) }
         }
     }
 
-    fun onMicPermissionResult(granted: Boolean) =
-        _state.update { it.copy(setup = it.setup.copy(micGranted = granted)) }
-
     /** Downloads the sherpa-onnx speech bundles, updating one row at a time. */
-    fun downloadSpeechModels() {
+    fun downloadSpeechModels(only: SpeechModel? = null) {
         if (_state.value.setup.busy) return
         _state.update { it.copy(setup = it.setup.copy(busy = true)) }
         viewModelScope.launch {
-            container.models.install()
+            container.models.install(if (only != null) listOf(only) else SpeechModel.entries)
                 .onCompletion { _state.update { s -> s.copy(setup = s.setup.copy(busy = false)) }; refreshSetup() }
                 .collect { progress -> updateSpeechRow(progress) }
         }
+    }
+
+    /** Downloads the one model whose row was tapped. */
+    fun downloadSpeechModel(id: String) {
+        SpeechModel.entries.firstOrNull { it.name == id }?.let { downloadSpeechModels(it) }
     }
 
     private fun updateSpeechRow(progress: InstallProgress) = _state.update { state ->
@@ -363,10 +403,19 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
     fun canUseFullScreen(): Boolean = IncomingCallNotifier.canUseFullScreen(getApplication())
 
     /** Called by the activity when it was opened by the call notification, and by the alarm when the app is visible. */
-    fun onIncomingCall(fromAlarm: Boolean) {
+    fun onIncomingCall(fromAlarm: Boolean, taskId: Long = CallAlarmReceiver.NO_TASK) {
         val current = _state.value.screen
-        if (current == Screen.SESSION || current == Screen.INCOMING_CALL) return
-        _state.update { it.copy(screen = Screen.INCOMING_CALL, overLockscreen = fromAlarm, editor = null) }
+        val forTask = taskId.takeIf { it != CallAlarmReceiver.NO_TASK }
+        if (current == Screen.SESSION || current == Screen.INCOMING_CALL) {
+            // A reminder that comes due mid-call is not lost: it rings as soon as this call is over.
+            if (forTask != null && forTask != _state.value.callTaskId && forTask !in queuedReminders) {
+                queuedReminders.addLast(forTask)
+            }
+            return
+        }
+        _state.update {
+            it.copy(screen = Screen.INCOMING_CALL, overLockscreen = fromAlarm, editor = null, callTaskId = forTask)
+        }
         ringer.start()
         ringTimeout?.cancel()
         ringTimeout = viewModelScope.launch {
@@ -378,10 +427,19 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
     /** Declined or timed out (30s): silence the ringer and go back Home. */
     fun declineCall() = endToHome()
 
-    /** "Snooze 15m" on the ringing call: push today's tasks back 15 minutes and drop the call. */
+    /**
+     * "Snooze" on the ringing call. A task reminder just rings again in [REMINDER_SNOOZE_MINUTES] and leaves the
+     * deadline alone; the daily call pushes today's tasks back 15 minutes.
+     */
     fun snoozeCall() {
         ringTimeout?.cancel()
         ringer.stop()
+        val taskId = _state.value.callTaskId
+        if (taskId != null) {
+            container.scheduler.snoozeReminder(taskId, REMINDER_SNOOZE_MINUTES)
+            endToHome()
+            return
+        }
         viewModelScope.launch {
             safely { run(TaskCommand.Snooze(SNOOZE_MINUTES)) }
             endToHome()
@@ -391,15 +449,16 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
     /** Silence the ringer (and release audio focus) before the session starts speaking/listening. */
     fun answerCall() {
         ringer.stop()
-        beginSession()
+        beginSession(_state.value.callTaskId)
     }
 
     /** The user opened the assistant themselves (Talk button): same session, no ringing. */
-    fun startSession() = beginSession()
+    fun startSession() = beginSession(null)
 
     // ---- voice session -------------------------------------------------------------------
 
-    private fun beginSession() {
+    /** [taskId] set: a reminder call, briefed on that one task only. */
+    private fun beginSession(taskId: Long?) {
         _state.update { it.copy(canUndo = false) }
         ringTimeout?.cancel()
         ringer.stop()
@@ -408,13 +467,16 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
         _state.update {
             it.copy(
                 screen = Screen.SESSION,
-                session = SessionState(startedAt = container.clock.millis(), micReady = container.stt.isReady),
+                session = SessionState(startedAt = container.clock.millis(), micReady = container.stt.isReady, handsFree = handsFree),
                 plan = null,
-                editor = null
+                editor = null,
+                callTaskId = taskId
             )
         }
         runTurn {
-            val briefing = withContext(Dispatchers.IO) { engine.briefing() }
+            val briefing = withContext(Dispatchers.IO) {
+                taskId?.let { engine.taskBriefing(it) } ?: engine.briefing()
+            }
             assistantSays(briefing, outcome = null)
         }
     }
@@ -429,9 +491,20 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
         container.speaker.stop()
         engine.resetContext()
         _state.update {
-            it.copy(screen = Screen.HOME, session = SessionState(), plan = null, overLockscreen = false)
+            it.copy(screen = Screen.HOME, session = SessionState(), plan = null, overLockscreen = false, callTaskId = null)
         }
         viewModelScope.launch { safely { reloadTasksAsync() } }
+        ringNextQueuedReminder()
+    }
+
+    /** Rings the oldest reminder that came due during the call that just ended, skipping tasks finished since. */
+    private fun ringNextQueuedReminder() {
+        val id = queuedReminders.removeFirstOrNull() ?: return
+        viewModelScope.launch {
+            val stillOpen = withContext(Dispatchers.IO) { runCatching { container.store.get(id) }.getOrNull() }
+                ?.let { !it.isDone } == true
+            if (stillOpen) onIncomingCall(fromAlarm = false, taskId = id) else ringNextQueuedReminder()
+        }
     }
 
     /** Typed text and tapped suggestions take the same path as a spoken transcript. */
@@ -442,41 +515,125 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
         runTurn { handleUtterance(text) }
     }
 
-    fun onMicPress() {
-        if (!container.stt.isReady) {
-            setHint("Voice input isn't installed yet. Type below or tap a suggestion.")
-            return
-        }
-        if (!acceptingInput()) return
-        interruptSpeech()
-        setPhase(Phase.LISTENING)
-        runTurn {
-            try {
-                container.stt.startListening()
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                setPhase(Phase.IDLE)
-                setHint("The microphone isn't available. Type your request instead.")
-            }
+    /** Switches between hold-to-talk and the assistant listening by itself after each reply. */
+    fun setHandsFree(on: Boolean) {
+        handsFree = on
+        _state.update { it.copy(session = it.session.copy(handsFree = on, hint = null)) }
+        val phase = _state.value.session.phase
+        if (on) {
+            if (phase == Phase.IDLE) runTurn { }
+        } else if (phase == Phase.LISTENING) {
+            pauseListening(null)
         }
     }
 
-    fun onMicRelease() {
-        if (_state.value.session.phase != Phase.LISTENING) return
-        setPhase(Phase.THINKING)
-        runTurn {
+    /** Hold-to-talk: the button went down. Interrupts the assistant and records until release. */
+    fun onMicPress() {
+        if (!container.stt.isReady) {
+            setHint("Voice input isn't ready. Allow the microphone and install the speech model, or type below.")
+            return
+        }
+        val phase = _state.value.session.phase
+        if (phase == Phase.THINKING) return
+        if (phase == Phase.SPEAKING) container.speaker.stop()
+        turnJob?.cancel()
+        turnJob = viewModelScope.launch {
+            setPhase(Phase.LISTENING)
+            _state.update { it.copy(session = it.session.copy(hint = null)) }
             val transcript = try {
-                container.stt.stopAndTranscribe().trim()
+                container.stt.listen(manual = true, onCaptured = { setPhase(Phase.THINKING) }).trim()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                ""
+                Log.w(TAG, "listening failed", e)
+                setPhase(Phase.IDLE)
+                setHint("The microphone isn't available. Type your request instead.")
+                return@launch
             }
             if (transcript.isEmpty()) {
-                assistantSays("I didn't catch that. Try again, or type your request.", outcome = null)
+                assistantSays("I didn't catch that. Hold the mic, speak, then let go.", outcome = null)
             } else {
                 handleUtterance(transcript)
+            }
+            listenLoop()
+        }
+    }
+
+    /** Hold-to-talk: the button was released; what was recorded is transcribed and sent. */
+    fun onMicRelease() {
+        if (_state.value.session.phase == Phase.LISTENING) container.stt.finishUtterance()
+    }
+
+    /** Hands-free mode: tap to send what has been said so far, or to pause/resume listening. */
+    fun onMicTap() {
+        if (!container.stt.isReady) {
+            setHint("Voice input isn't ready. Allow the microphone and install the speech model, or type below.")
+            return
+        }
+        when (_state.value.session.phase) {
+            // Mid-sentence a tap means "I'm done, send it"; before the user has said anything it pauses.
+            Phase.LISTENING -> if (!container.stt.finishUtterance()) pauseListening("Mic paused. Tap the mic to talk.")
+            Phase.SPEAKING -> {
+                interruptSpeech()
+                runTurn { }
+            }
+            Phase.IDLE -> runTurn { }
+            Phase.THINKING -> Unit
+        }
+    }
+
+    /** Called when the microphone permission dialog is answered mid-call, so listening can begin. */
+    fun onMicPermissionResult(granted: Boolean) {
+        _state.update { it.copy(setup = it.setup.copy(micGranted = granted)) }
+        val s = _state.value
+        if (granted && s.screen == Screen.SESSION) {
+            _state.update { it.copy(session = it.session.copy(micReady = container.stt.isReady, hint = null)) }
+            if (s.session.phase == Phase.IDLE) runTurn { }
+        }
+    }
+
+    private fun pauseListening(hint: String?) {
+        turnJob?.cancel()
+        setPhase(Phase.IDLE)
+        _state.update { it.copy(session = it.session.copy(hint = hint)) }
+    }
+
+    /**
+     * Hands-free turn-taking: with the assistant done talking, open the microphone, wait for the user
+     * to speak and pause, answer, and go round again. Stops when the call ends, the screen changes,
+     * or nothing has been said for a while (the mic button then resumes it).
+     */
+    private suspend fun listenLoop() {
+        var silentListens = 0
+        fun canListen() = handsFree && _state.value.screen == Screen.SESSION && inForeground && container.stt.isReady
+        while (currentCoroutineContext().isActive && canListen()) {
+            // Let the tail of the assistant's voice die away so it is not heard as the user.
+            delay(LISTEN_GAP_MS)
+            if (!canListen()) return
+            setPhase(Phase.LISTENING)
+            _state.update { it.copy(session = it.session.copy(hint = null)) }
+            var captured = false
+            val transcript = try {
+                container.stt.listen(onCaptured = { captured = true; setPhase(Phase.THINKING) }).trim()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "listening failed", e)
+                setPhase(Phase.IDLE)
+                setHint("The microphone isn't available. Type your request instead.")
+                return
+            }
+            if (transcript.isNotEmpty()) {
+                silentListens = 0
+                handleUtterance(transcript)
+            } else {
+                // Heard something but could not read it: say so once. Silence is not nagged about.
+                if (captured) assistantSays("I didn't catch that. Please say it again.", outcome = null)
+                if (++silentListens >= MAX_SILENT_LISTENS) {
+                    setPhase(Phase.IDLE)
+                    setHint("I stopped listening. Tap the mic when you want to talk.")
+                    return
+                }
             }
         }
     }
@@ -491,7 +648,13 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
                 val openTitles = engine.tasks().filter { !it.isDone }.map { it.title }
                 // The pending draft tells the parser a short reply ("an hour", "high") answers the
                 // question just asked. Spoken adds are asked for name, deadline, duration and priority.
-                val parsed = container.parser.parse(text, ParseContext(openTitles, engine.pendingDraft))
+                val recent = _state.value.session.turns
+                    .takeLast(ParseContext.HISTORY_TURNS)
+                    .map { ConversationTurn(it.fromUser, it.text) }
+                val parsed = container.parser.parse(
+                    text,
+                    ParseContext(openTitles, engine.pendingDraft, recent),
+                )
                 command = parsed
                 engine.executeSpoken(parsed).also { result ->
                     if (debuggable) Log.i(TAG, "heard=\"$text\" parsed=$parsed -> ${result.outcome}: ${result.spoken}")
@@ -517,13 +680,16 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
         try {
             container.speaker.speak(text)
         } finally {
-            setPhase(Phase.IDLE)
+            // A cancelled turn was replaced (or ended) by whoever cancelled it, which owns the
+            // phase now; resetting it here could overwrite the new turn's LISTENING.
+            if (currentCoroutineContext().isActive) setPhase(Phase.IDLE)
         }
     }
 
+    /** Typing is allowed any time the assistant is not busy working out an answer, including while it listens. */
     private fun acceptingInput(): Boolean {
         val phase = _state.value.session.phase
-        return phase == Phase.IDLE || phase == Phase.SPEAKING
+        return phase == Phase.IDLE || phase == Phase.SPEAKING || phase == Phase.LISTENING
     }
 
     private fun interruptSpeech() {
@@ -533,9 +699,13 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Runs one turn, then (in hands-free mode) hands the floor back to the user by listening again. */
     private fun runTurn(block: suspend () -> Unit) {
         turnJob?.cancel()
-        turnJob = viewModelScope.launch { block() }
+        turnJob = viewModelScope.launch {
+            block()
+            listenLoop()
+        }
     }
 
     private fun addTurn(fromUser: Boolean, text: String, outcome: Outcome? = null) {
@@ -613,6 +783,9 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun reloadTasks() {
         val tasks = container.store.all()
+        // Every add, edit, completion, delete and undo lands here, so the reminder alarms follow along.
+        runCatching { container.scheduler.syncReminders(tasks) }
+            .onFailure { Log.w(TAG, "Could not schedule task reminders", it) }
         _state.update { it.copy(tasks = tasks, loaded = true) }
     }
 
@@ -635,6 +808,11 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
 private const val TAG = "KukooTurn"
 private const val RING_TIMEOUT_MS = 30_000L
 private const val SNOOZE_MINUTES = 15
+private const val REMINDER_SNOOZE_MINUTES = 5
+private const val LISTEN_GAP_MS = 400L
+
+/** Listens this many times in a row (about 10 s each) with no speech before pausing. */
+private const val MAX_SILENT_LISTENS = 3
 
 /** A 1.5 GB pull over conference wifi drops often; each retry resumes from the partial files. */
 private const val PULL_ATTEMPTS = 40

@@ -3,6 +3,11 @@ package com.example.kukoo.ui.session
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -111,14 +116,16 @@ private fun ActionChip(label: String, accent: Color?, enabled: Boolean, onClick:
     }
 }
 
-/** Screen 3 of 4: the voice conversation with turn-based tap-to-talk. */
+/** Screen 3 of 4: the hands-free voice conversation; the assistant listens again after every reply. */
 @Composable
 fun VoiceSessionScreen(
     session: SessionState,
     clock: Clock,
     onSend: (String) -> Unit,
+    onMicTap: () -> Unit,
     onMicPress: () -> Unit,
     onMicRelease: () -> Unit,
+    onToggleHandsFree: () -> Unit,
     onEnd: () -> Unit,
     canUndo: Boolean = false,
     events: Flow<UiEvent> = emptyFlow(),
@@ -156,7 +163,7 @@ fun VoiceSessionScreen(
         draft = ""
         onSend(text)
     }
-    val canSend = session.phase == Phase.IDLE || session.phase == Phase.SPEAKING
+    val canSend = session.phase != Phase.THINKING
 
     Column(
         modifier = Modifier
@@ -275,8 +282,14 @@ fun VoiceSessionScreen(
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Spacer(Modifier.size(56.dp))
-            TalkButton(listening = session.phase == Phase.LISTENING, onPress = onMicPress, onRelease = onMicRelease)
+            AutoToggle(on = session.handsFree, onClick = onToggleHandsFree)
+            TalkButton(
+                listening = session.phase == Phase.LISTENING,
+                handsFree = session.handsFree,
+                onTap = onMicTap,
+                onPress = onMicPress,
+                onRelease = onMicRelease
+            )
             Box(
                 modifier = Modifier
                     .size(56.dp)
@@ -290,7 +303,7 @@ fun VoiceSessionScreen(
         }
 
         Text(
-            text = session.hint ?: if (session.micReady) "Hold to talk, release to send" else "Microphone input is not set up yet — use the box or a suggestion",
+            text = session.hint ?: if (session.micReady) micHint(session.phase, session.handsFree) else "Microphone input is not set up yet — use the box or a suggestion",
             style = MaterialTheme.typography.bodySmall,
             color = Color.White.copy(alpha = 0.6f),
             textAlign = TextAlign.Center,
@@ -302,25 +315,71 @@ fun VoiceSessionScreen(
     }
 }
 
+/** Switches between hold-to-talk and the assistant listening by itself after each reply. */
 @Composable
-private fun TalkButton(listening: Boolean, onPress: () -> Unit, onRelease: () -> Unit) {
+private fun AutoToggle(on: Boolean, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(56.dp)
+            .clip(CircleShape)
+            .background(if (on) CallAnswer.copy(alpha = 0.9f) else Color.White.copy(alpha = 0.12f))
+            .semantics { contentDescription = if (on) "Hands-free on" else "Hands-free off" }
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Text("Auto", style = MaterialTheme.typography.labelMedium, color = Color.White)
+    }
+}
+
+/**
+ * Hold-to-talk by default: recording lasts as long as the button is held. In hands-free mode the
+ * assistant listens by itself, and a tap sends what has been said so far.
+ */
+@Composable
+private fun TalkButton(
+    listening: Boolean,
+    handsFree: Boolean,
+    onTap: () -> Unit,
+    onPress: () -> Unit,
+    onRelease: () -> Unit
+) {
+    // The animation only exists while listening, so an idle screen does no per-frame work.
+    val scale = if (listening) {
+        val pulse = rememberInfiniteTransition(label = "mic pulse")
+        val pulseScale by pulse.animateFloat(
+            initialValue = 1f,
+            targetValue = 1.15f,
+            animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse),
+            label = "mic pulse scale"
+        )
+        pulseScale
+    } else {
+        1f
+    }
+    val gesture = if (handsFree) {
+        Modifier.clickable(onClick = onTap)
+    } else {
+        Modifier.pointerInput(Unit) {
+            detectTapGestures(onPress = {
+                onPress()
+                try {
+                    awaitRelease()
+                } finally {
+                    onRelease()
+                }
+            })
+        }
+    }
     Box(
         modifier = Modifier
             .size(76.dp)
-            .scale(if (listening) 1.12f else 1f)
+            .scale(scale)
             .clip(CircleShape)
             .background(if (listening) CallAnswer else Indigo40)
-            .semantics { contentDescription = "Hold to talk" }
-            .pointerInput(Unit) {
-                detectTapGestures(onPress = {
-                    onPress()
-                    try {
-                        awaitRelease()
-                    } finally {
-                        onRelease()
-                    }
-                })
-            },
+            .semantics {
+                contentDescription = if (handsFree) "Tap to send or pause" else "Hold to talk"
+            }
+            .then(gesture),
         contentAlignment = Alignment.Center
     ) {
         Icon(Icons.Default.Mic, contentDescription = null, tint = Color.White, modifier = Modifier.size(34.dp))
@@ -354,6 +413,21 @@ private fun TurnBubble(turn: Turn) {
                 modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
             )
         }
+    }
+}
+
+private fun micHint(phase: Phase, handsFree: Boolean): String = when {
+    !handsFree -> when (phase) {
+        Phase.LISTENING -> "Listening — release to send"
+        Phase.SPEAKING -> "Hold the mic to interrupt and talk"
+        Phase.THINKING -> "One moment…"
+        Phase.IDLE -> "Hold the mic to talk, release to send"
+    }
+    else -> when (phase) {
+        Phase.LISTENING -> "Listening — just talk. Tap the mic when you're done."
+        Phase.SPEAKING -> "Tap the mic to interrupt and talk"
+        Phase.THINKING -> "One moment…"
+        Phase.IDLE -> "Tap the mic to talk"
     }
 }
 

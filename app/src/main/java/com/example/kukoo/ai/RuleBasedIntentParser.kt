@@ -1,5 +1,6 @@
 package com.example.kukoo.ai
 
+import com.example.kukoo.domain.ChatKind
 import com.example.kukoo.domain.DayRef
 import com.example.kukoo.domain.DeadlineSpec
 import com.example.kukoo.domain.DraftField
@@ -32,10 +33,17 @@ class RuleBasedIntentParser : IntentParser {
      * ordinary commands, so "what's due today?" still works mid-question.
      */
     fun parseReply(utterance: String, draft: TaskDraft): TaskCommand {
-        val t = normalize(utterance)
+        // A reply to "how long?" or "how important?" is a duration or a priority, never a title,
+        // so every known mishearing can safely be corrected ("honor" -> "an hour").
+        val t = normalize(SpeechRepair.repairAnswer(utterance))
         if (t.isEmpty()) return TaskCommand.Unsupported(utterance)
+        val expecting = draft.nextMissing()
+        // "skip it" and "no" answer the reminder question; they do not cancel the task.
+        if (expecting == DraftField.REMINDER) {
+            reminderAnswer(t)?.let { return TaskCommand.FillTask(TaskDraft(reminderMin = it)) }
+        }
         if (discardDraft.matches(t)) return TaskCommand.DiscardDraft
-        val expecting = draft.nextMissing() ?: return parseNow(utterance)
+        if (expecting == null) return parseNow(utterance)
         if (expecting == DraftField.TITLE) return titleReply(t, utterance)
 
         // A command that clearly concerns another task wins over reading its words as an answer:
@@ -56,6 +64,13 @@ class RuleBasedIntentParser : IntentParser {
         }
         val answer = replyFields(t, expecting)
         return if (!answer.isBlank) TaskCommand.FillTask(answer) else command
+    }
+
+    /** The answer to "do you want a reminder call?": [TaskDraft.NO_REMINDER], minutes before, or null if it is neither. */
+    private fun reminderAnswer(t: String): Int? {
+        if (noReminderReply.matches(t)) return TaskDraft.NO_REMINDER
+        val body = t.replace(reminderLeadIn, "").replace(reminderTail, "").trim()
+        return bareDuration(body)
     }
 
     /** "it", "that", "the task": words for the task being set up, or no task named at all. */
@@ -113,7 +128,7 @@ class RuleBasedIntentParser : IntentParser {
             DraftField.DURATION -> if (minutes == null) minutes = bareDuration(left)
             DraftField.PRIORITY -> if (priority == null) priority = bareWordPriority(left)
             DraftField.DEADLINE -> if (spec == null) spec = bareHour(left)
-            DraftField.TITLE -> Unit
+            DraftField.TITLE, DraftField.REMINDER -> Unit
         }
         return TaskDraft(deadline = spec, durationMin = minutes, priority = priority)
     }
@@ -136,9 +151,17 @@ class RuleBasedIntentParser : IntentParser {
 
     /** "6" or "6:30" as the answer to *when*: read like "at 6" would be. */
     private fun bareHour(text: String): DeadlineSpec? {
-        val m = bareHourRe.matchEntire(text.trim()) ?: return null
+        // "five" alone is an answer to "when is it due", the same as "5".
+        val m = bareHourRe.matchEntire(hourWords[text.trim()] ?: text.trim()) ?: return null
         return parseTime(m.groupValues[1], m.groupValues[2], "")?.let { DeadlineSpec.Relative(time = it) }
     }
+
+    /**
+     * Reads the tail of "move X to …" / "change the deadline to …". Everything after "to" is a
+     * deadline by construction, so a bare hour is allowed here ("move the deck to five") even
+     * though a lone number elsewhere is too ambiguous to read as a time.
+     */
+    private fun deadlineTail(text: String): DeadlineSpec? = extractWhen(text).spec ?: bareHour(text)
 
     fun parseNow(utterance: String): TaskCommand {
         val t = normalize(utterance)
@@ -180,17 +203,17 @@ class RuleBasedIntentParser : IntentParser {
             return TaskCommand.UpdateTask(ref, TaskPatch(durationMin = minutes))
         }
         changeDeadline.matchEntire(t)?.let { m ->
-            val spec = extractWhen(m.groupValues[2]).spec ?: return TaskCommand.Unsupported(utterance)
+            val spec = deadlineTail(m.groupValues[2]) ?: return TaskCommand.Unsupported(utterance)
             val ref = m.groupValues[1].takeIf { it.isNotBlank() }?.let(::byTitle) ?: TaskRef.Last
             return TaskCommand.UpdateTask(ref, TaskPatch(deadline = spec))
         }
         deadlineOfTask.matchEntire(t)?.let { m ->
-            val spec = extractWhen(m.groupValues[2]).spec ?: return TaskCommand.Unsupported(utterance)
+            val spec = deadlineTail(m.groupValues[2]) ?: return TaskCommand.Unsupported(utterance)
             return TaskCommand.UpdateTask(byTitle(m.groupValues[1]), TaskPatch(deadline = spec))
         }
 
         move.matchEntire(t)?.let { m ->
-            val spec = extractWhen(m.groupValues[2]).spec ?: return TaskCommand.Unsupported(utterance)
+            val spec = deadlineTail(m.groupValues[2]) ?: return TaskCommand.Unsupported(utterance)
             return TaskCommand.UpdateTask(byTitle(m.groupValues[1]), TaskPatch(deadline = spec))
         }
 
@@ -212,8 +235,35 @@ class RuleBasedIntentParser : IntentParser {
             val scope = if (allScope.containsMatchIn(t)) QueryScope.ALL_OPEN else QueryScope.TODAY
             return TaskCommand.QueryTasks(scope)
         }
+
+        // "change the gym" — a task, but no change. Asking beats guessing: read as an add, a
+        // misheard "modify the gym" became a task called "Mortify the gym".
+        changeNoValue.matchEntire(t)?.let { m ->
+            val name = cleanTitle(m.groupValues[1])
+            if (name.isNotEmpty()) return TaskCommand.AskWhatToChange(byTitle(name))
+        }
+
         implicitAdd(t, utterance)?.let { return it }
+        chatKind(t)?.let { return TaskCommand.Chat(it) }
         return TaskCommand.Unsupported(utterance)
+    }
+
+    /**
+     * Pleasantries, which every real conversation contains. Checked after the commands so a task
+     * called "Thank Priya" is still a task, and only on a short utterance so "okay move the deck
+     * to five" is never read as a bare "okay".
+     */
+    private fun chatKind(t: String): ChatKind? {
+        if (t.split(' ').size > MAX_CHAT_WORDS) return null
+        return when {
+            // "yeah, thank you" is gratitude, not a bare acknowledgement, so this is checked first.
+            t.contains("thank") -> ChatKind.THANKS
+            thanks.matches(t) -> ChatKind.THANKS
+            greeting.matches(t) -> ChatKind.GREETING
+            helpRequest.matches(t) -> ChatKind.HELP
+            acknowledge.matches(t) -> ChatKind.ACKNOWLEDGE
+            else -> null
+        }
     }
 
     /**
@@ -380,19 +430,82 @@ class RuleBasedIntentParser : IntentParser {
         return words.joinToString(" ")
     }
 
-    private fun normalize(raw: String): String = raw.lowercase(Locale.ROOT)
+    private fun normalize(raw: String): String = SpeechRepair.repairCommand(raw).lowercase(Locale.ROOT)
         .replace("p.m.", "pm")
         .replace("a.m.", "am")
         .replace('’', '\'')
+        // Speech recognizers often hear "tomorrow at 6" as "tomorrow's 6"; only before a time, so
+        // "tomorrow's tasks" is left alone.
+        .replace(
+            Regex("\\b(today|tomorrow|tonight)'s(?=\\s+(?:\\d|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|noon|midnight)\\b)"),
+            "$1 at"
+        )
         .replace(Regex("(?<!\\d):|:(?!\\d)"), " ")
         .replace(Regex("[?!,;\"]"), " ")
         .replace(Regex("(?<!\\d)\\.|\\.(?!\\d)"), " ")
         .replace(Regex("\\s+"), " ")
         .trim()
+        .let(::normalizeTimes)
+        .let(::stripLeadIn)
+
+    /**
+     * Spoken times come in many shapes: "five pm", "five in the evening", "5 o'clock", "five thirty",
+     * "half past five", "five pm in the evening". All of them are rewritten to "5 pm" / "5:30 pm" /
+     * "5" so one set of patterns reads them.
+     */
+    private fun normalizeTimes(text: String): String {
+        var t = " $text "
+        val word = hourWordAlternation
+        // "half past five", "quarter past five", "quarter to six"
+        t = t.replace(Regex("\\bhalf past ($word|\\d{1,2})\\b")) { "${digits(it.groupValues[1])}:30" }
+        t = t.replace(Regex("\\bquarter past ($word|\\d{1,2})\\b")) { "${digits(it.groupValues[1])}:15" }
+        // "five thirty", "five forty five", "five fifteen"
+        t = t.replace(Regex("\\b($word|\\d{1,2}) (thirty|fifteen|forty[ -]?five)\\b")) {
+            val mins = when (it.groupValues[2]) { "thirty" -> "30"; "fifteen" -> "15"; else -> "45" }
+            "${digits(it.groupValues[1])}:$mins"
+        }
+        // number words right before a meridiem, "o'clock" or a part of the day
+        t = t.replace(Regex("\\b($word)(?=\\s*(?:am|pm|o'?clock|in the (?:morning|afternoon|evening)|at night))")) {
+            digits(it.groupValues[1])
+        }
+        t = t.replace(Regex("(\\d{1,2}(?::\\d{2})?)\\s*o'?clock"), "$1")
+        // "5 in the evening" -> "5 pm", "7 in the morning" -> "7 am"
+        t = t.replace(Regex("(\\d{1,2}(?::\\d{2})?)\\s+(?:in the|at|of the)\\s+morning\\b"), "$1 am")
+        t = t.replace(Regex("(\\d{1,2}(?::\\d{2})?)\\s+(?:(?:in the|at|of the)\\s+(?:afternoon|evening)|at night)\\b"), "$1 pm")
+        // "5 pm in the evening": the part of the day only repeats the meridiem
+        t = t.replace(Regex("\\b(am|pm)\\s+(?:in the (?:morning|afternoon|evening)|at night)\\b"), "$1")
+        return t.replace(Regex("\\s+"), " ").trim()
+    }
+
+    private fun digits(word: String): String = hourWords[word] ?: word
+
+    /**
+     * People talk to an assistant conversationally: "can you add gym at 7", "please move the deck",
+     * "I want to add a task". The polite opening carries no meaning, so it is dropped (repeatedly,
+     * for "okay please add ...") before the request is read.
+     */
+    private fun stripLeadIn(text: String): String {
+        var t = text
+        while (true) {
+            val next = t.replace(leadIn, "")
+            if (next == t || next.isBlank()) return t
+            t = next
+        }
+    }
 
     private companion object {
+        val leadIn = Regex(
+            "^(?:hey|hi|hello|okay|ok|so|um|uh|well|kukoo|please|" +
+                "yes|yeah|yep|yup|sure|alright|cool|great|fine|" +
+                "(?:can|could|would|will) you(?: please)?|" +
+                "i (?:want|need|would like|wanna) to|i'd like to|i want you to|i'll|let's|let me|" +
+                "go ahead and)\\s+"
+        )
+
         val leadFillers = setOf("to", "for", "called", "named", "that", "says")
         val trailFillers = setOf("to", "for", "by", "at", "on", "due", "before", "and", "in")
+
+        val hourWordAlternation = "one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve"
 
         val hourWords = mapOf(
             "one" to "1", "two" to "2", "three" to "3", "four" to "4", "five" to "5", "six" to "6",
@@ -451,8 +564,26 @@ class RuleBasedIntentParser : IntentParser {
             "(?:please )?(?:change|set|update)\\s+(?:the\\s+|my\\s+)?(.+?)\\s+(?:deadline|due date|due time)\\s+to\\s+(.+)"
         )
         val move = Regex(
-            "(?:please )?(?:move|push|re-?schedule|postpone|shift|bump)\\s+(?:the\\s+|my\\s+)?(.+?)\\s+" +
-                "(?:to|until|till|for)\\s+(.+)"
+            "(?:please )?(?:move|push|re-?schedule|postpone|shift|bump|modify|edit|adjust)\\s+" +
+                "(?:the\\s+|my\\s+)?(.+?)\\s+(?:to|until|till|for)\\s+(.+)"
+        )
+
+        /** "modify the gym", "change my deck": a task named, with no new value. */
+        val changeNoValue = Regex(
+            "(?:please )?(?:modify|edit|change|update|adjust|reschedule)\\s+(?:the\\s+|my\\s+|that\\s+|this\\s+)?(.+?)" +
+                "(?:\\s+(?:task|to-?do))?"
+        )
+
+        const val MAX_CHAT_WORDS = 5
+        val thanks = Regex("(?:ok(?:ay)?[, ]+)?(?:thanks?|thank you|thx|cheers|appreciate it)(?: (?:a lot|so much|very much|mate|buddy))?")
+        val greeting = Regex("(?:hi|hey|hello|yo|good (?:morning|afternoon|evening))(?: (?:there|kukoo))?")
+        val acknowledge = Regex(
+            "(?:yes|yeah|yep|yup|sure|ok(?:ay)?|alright|right|got it|sounds good|perfect|great|nice|cool|fine|good)" +
+                "(?:[, ]+(?:thanks?|thank you))?"
+        )
+        val helpRequest = Regex(
+            "(?:please )?(?:help(?: me)?|what can you do|what do you do|what can i (?:say|ask)|" +
+                "how does this work|what are my options)"
         )
 
         val add = Regex(
@@ -476,6 +607,9 @@ class RuleBasedIntentParser : IntentParser {
                 "name the task|it should be|the name should be)\\s+)"
         )
         val durationLeadIn = Regex("^(?:(?:it(?:'ll| will)? takes?|maybe|about|around|roughly|like|for)\\s+)+")
+        val noReminderReply = Regex("(?:no|none|nope|nah|nothing|skip(?: it)?|no reminders?|no thanks|not needed|no need)")
+        val reminderLeadIn = Regex("^(?:(?:please )?(?:call|remind) me|about|around|maybe|make it|let'?s say|yes)\\s+")
+        val reminderTail = Regex("\\s+(?:before|ahead|early|in advance)$")
         val draftWords = setOf("it", "its", "that", "this", "the", "new", "the new")
         val notUrgent = Regex("\\snot\\s+(?:that\\s+|very\\s+|so\\s+)?(?:urgent|important)(?=\\s)")
         val bareHourRe = Regex("(\\d{1,2})(?::(\\d{2}))?")

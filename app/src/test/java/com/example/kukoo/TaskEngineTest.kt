@@ -19,6 +19,7 @@ import com.example.kukoo.domain.TaskStatus
 import com.example.kukoo.domain.TimeFormat
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -283,6 +284,87 @@ class TaskEngineTest {
         assertEquals(Outcome.OK, res.outcome)
         assertEquals("Added Call mom, due tomorrow at 9 AM, 30 minutes.", res.spoken)
         assertEquals(tomorrow(9), r.store.all().single().deadline)
+    }
+
+    @Test
+    fun add_withReminder_savesItAndSaysWhenTheCallComes() {
+        val r = rig(emptyList()) // 3 PM
+        val res = r.run(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(today(18)), reminderMin = 30))
+        assertEquals(Outcome.OK, res.outcome)
+        assertTrue(res.spoken, res.spoken.contains("I'll call you 30 minutes before."))
+        val saved = r.store.all().single()
+        assertEquals(30, saved.reminderMin)
+        assertEquals(today(17) + 30 * 60_000L, saved.reminderAt)
+    }
+
+    @Test
+    fun add_reminderThatWouldRingBeforeNow_isRefused() {
+        val r = rig(emptyList()) // 3 PM: a 30 minute reminder for a 3:20 PM task would ring at 2:50 PM
+        val deadline = today(15) + 20 * 60_000L
+        val res = r.run(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(deadline), reminderMin = 30))
+        assertEquals(Outcome.REJECTED, res.outcome)
+        assertTrue(res.spoken, res.spoken.contains("has already passed"))
+        assertTrue(r.store.all().isEmpty())
+        // A shorter reminder for the same task is fine.
+        assertEquals(Outcome.OK, r.run(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(deadline), reminderMin = 10)).outcome)
+    }
+
+    @Test
+    fun add_reminderNeedsADeadline_andASaneLength() {
+        val r = rig(emptyList())
+        assertEquals(Outcome.REJECTED, r.run(TaskCommand.AddTask("Gym", reminderMin = 10)).outcome)
+        assertEquals(Outcome.REJECTED, r.run(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(tomorrow(18)), reminderMin = 0)).outcome)
+        assertEquals(Outcome.REJECTED, r.run(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(tomorrow(18)), reminderMin = 2000)).outcome)
+        assertTrue(r.store.all().isEmpty())
+    }
+
+    @Test
+    fun update_movingTheDeadlineSoonerThanTheReminder_dropsTheReminderAndSaysSo() {
+        val r = rig(emptyList())
+        r.run(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(today(18)), reminderMin = 30))
+        val id = r.byTitle("Gym").id
+        val res = r.run(
+            TaskCommand.UpdateTask(TaskRef.ById(id), TaskPatch(deadline = DeadlineSpec.Exact(today(15) + 10 * 60_000L)))
+        )
+        assertEquals(Outcome.OK, res.outcome)
+        assertTrue(res.spoken, res.spoken.contains("reminder removed"))
+        assertNull(r.byTitle("Gym").reminderMin)
+    }
+
+    @Test
+    fun update_settingAClashingReminder_isRefused_andSavingUnrelatedEditsIsNot() {
+        val r = rig(emptyList())
+        val soon = today(15) + 20 * 60_000L
+        r.run(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(soon), reminderMin = 10))
+        val id = r.byTitle("Gym").id
+        val clash = r.run(TaskCommand.UpdateTask(TaskRef.ById(id), TaskPatch(reminderMin = 30)))
+        assertEquals(Outcome.REJECTED, clash.outcome)
+        assertEquals(10, r.byTitle("Gym").reminderMin)
+        // The form resends the untouched reminder along with the deadline when only notes changed.
+        val notesOnly = r.run(
+            TaskCommand.UpdateTask(
+                TaskRef.ById(id),
+                TaskPatch(deadline = DeadlineSpec.Exact(soon), reminderMin = 10, notes = "bring shoes")
+            )
+        )
+        assertEquals(notesOnly.spoken, Outcome.OK, notesOnly.outcome)
+        assertEquals(10, r.byTitle("Gym").reminderMin)
+        // And the reminder can be turned off.
+        r.run(TaskCommand.UpdateTask(TaskRef.ById(id), TaskPatch(clearReminder = true)))
+        assertNull(r.byTitle("Gym").reminderMin)
+    }
+
+    @Test
+    fun taskBriefing_talksAboutOnlyThatTask() {
+        val r = rig(emptyList())
+        r.run(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(today(18)), durationMin = 60, priority = Priority.HIGH, reminderMin = 30))
+        r.run(TaskCommand.AddTask("Laundry", DeadlineSpec.Exact(today(19))))
+        val briefing = r.engine.taskBriefing(r.byTitle("Gym").id)!!
+        assertTrue(briefing, briefing.startsWith("Reminder: Gym is due today at 6 PM, in 3 hours."))
+        assertTrue(briefing, briefing.contains("1 hour, high priority"))
+        assertFalse(briefing, briefing.contains("Laundry"))
+        r.run(TaskCommand.CompleteTask(TaskRef.ById(r.byTitle("Gym").id)))
+        assertNull(r.engine.taskBriefing(r.byTitle("Gym").id))
     }
 
     @Test

@@ -10,6 +10,7 @@ import com.k2fsa.sherpa.onnx.OfflineTtsConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
@@ -52,17 +53,30 @@ class SherpaSpeaker(context: Context, private val models: ModelRepository) : Spe
         get() = models.isInstalled(SpeechModel.TTS_KOKORO) || models.isInstalled(SpeechModel.TTS_PIPER)
 
     override suspend fun speak(text: String) {
-        if (text.isBlank()) return
-        speaking.withLock {
+        trySpeak(text)
+    }
+
+    /** Loads the voice ahead of the first reply, so the opening line is not delayed by model load. */
+    fun warmUp() {
+        if (isReady) engine()
+    }
+
+    /**
+     * Speaks [text]; returns false when the voice could not produce any audio (it failed to load,
+     * or no audio output was available), so the caller can use another voice instead.
+     */
+    suspend fun trySpeak(text: String): Boolean {
+        if (text.isBlank()) return true
+        return speaking.withLock {
             stopped = false
             withContext(Dispatchers.IO) { speakBlocking(text) }
         }
     }
 
-    private suspend fun speakBlocking(text: String) {
-        val engine = engine() ?: return
+    private suspend fun speakBlocking(text: String): Boolean {
+        val engine = engine() ?: return false
         val sampleRate = engine.sampleRate()
-        val player = newTrack(sampleRate) ?: return
+        val player = newTrack(sampleRate) ?: return false
         track = player
         var framesWritten = 0L
         try {
@@ -97,8 +111,12 @@ class SherpaSpeaker(context: Context, private val models: ModelRepository) : Spe
                 if (n > 0) framesWritten += n
             }
             if (!stopped) awaitDrain(player, framesWritten)
+            return stopped || framesWritten > 0
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.w(TAG, "speak failed", e)
+            return stopped || framesWritten > 0
         } finally {
             track = null
             runCatching {

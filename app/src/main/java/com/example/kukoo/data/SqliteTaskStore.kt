@@ -27,7 +27,8 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
                 $CREATED INTEGER NOT NULL,
                 $COMPLETED INTEGER,
                 $RECURRENCE TEXT NOT NULL DEFAULT 'NONE',
-                $NOTES TEXT
+                $NOTES TEXT,
+                $REMINDER INTEGER
             )
             """.trimIndent()
         )
@@ -39,6 +40,9 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
         if (oldVersion < 2) {
             db.execSQL("ALTER TABLE $TABLE ADD COLUMN $RECURRENCE TEXT NOT NULL DEFAULT 'NONE'")
             db.execSQL("ALTER TABLE $TABLE ADD COLUMN $NOTES TEXT")
+        }
+        if (oldVersion < 3) {
+            db.execSQL("ALTER TABLE $TABLE ADD COLUMN $REMINDER INTEGER")
         }
     }
 
@@ -82,6 +86,7 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
         put(COMPLETED, completedAt)
         put(RECURRENCE, recurrence.name)
         put(NOTES, notes)
+        put(REMINDER, reminderMin)
     }
 
     private fun Cursor.toTask(): Task {
@@ -97,13 +102,14 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
             createdAt = getLong(getColumnIndexOrThrow(CREATED)),
             completedAt = longOrNull(COMPLETED),
             recurrence = Recurrence.fromName(getString(getColumnIndexOrThrow(RECURRENCE))),
-            notes = getColumnIndexOrThrow(NOTES).let { if (isNull(it)) null else getString(it) }
+            notes = getColumnIndexOrThrow(NOTES).let { if (isNull(it)) null else getString(it) },
+            reminderMin = longOrNull(REMINDER)?.toInt()
         )
     }
 
     private companion object {
         const val DB_NAME = "kukoo.db"
-        const val DB_VERSION = 2
+        const val DB_VERSION = 3
         const val TABLE = "tasks"
         const val ID = "id"
         const val TITLE = "title"
@@ -115,5 +121,6 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
         const val COMPLETED = "completed_at"
         const val RECURRENCE = "recurrence"
         const val NOTES = "notes"
+        const val REMINDER = "reminder_min"
     }
 }

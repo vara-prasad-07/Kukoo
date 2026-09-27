@@ -9,11 +9,12 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * Tap-to-talk [SpeechToText] on the platform [SpeechRecognizer], using the system default engine (online or offline).
+ * Hands-free [SpeechToText] on the platform [SpeechRecognizer], using the system default engine (online or offline).
  * The recognizer is only touched on the main thread, as the framework requires.
  */
 class AndroidSpeechToText(context: Context) : SpeechToText {
@@ -27,7 +28,7 @@ class AndroidSpeechToText(context: Context) : SpeechToText {
     /** Latest partial hypothesis, used if the final result never arrives. */
     private var lastPartial = ""
 
-    override suspend fun startListening() {
+    private suspend fun startListening() {
         check(isReady) { "Speech recognition unavailable" }
         withContext(Dispatchers.Main.immediate) {
             release()
@@ -86,12 +87,17 @@ class AndroidSpeechToText(context: Context) : SpeechToText {
         }
     }
 
-    override suspend fun stopAndTranscribe(): String {
+    // The platform recognizer finds the end of speech itself, so this only waits for its result.
+    override suspend fun listen(manual: Boolean, onCaptured: () -> Unit): String {
+        startListening()
         val done = result ?: return ""
-        withContext(Dispatchers.Main.immediate) { recognizer?.stopListening() }
-        val text = withTimeoutOrNull(RESULT_TIMEOUT_MS) { done.await() } ?: lastPartial
-        withContext(Dispatchers.Main.immediate) { release() }
-        return text.trim()
+        try {
+            val text = withTimeoutOrNull(LISTEN_TIMEOUT_MS) { done.await() } ?: lastPartial
+            onCaptured()
+            return text.trim()
+        } finally {
+            withContext(NonCancellable + Dispatchers.Main.immediate) { release() }
+        }
     }
 
     private fun release() {
@@ -122,6 +128,6 @@ class AndroidSpeechToText(context: Context) : SpeechToText {
 
     private companion object {
         const val TAG = "AndroidSpeechToText"
-        const val RESULT_TIMEOUT_MS = 5000L
+        const val LISTEN_TIMEOUT_MS = 20_000L
     }
 }

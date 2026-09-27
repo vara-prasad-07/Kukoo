@@ -28,6 +28,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.clip
+import androidx.compose.material.icons.filled.Download
 import com.example.kukoo.ui.ModelRow
 import com.example.kukoo.ui.SetupState
 
@@ -41,6 +44,7 @@ fun ModelSetupScreen(
     state: SetupState,
     onBack: () -> Unit,
     onDownloadSpeech: () -> Unit,
+    onDownloadSpeechModel: (String) -> Unit,
     onDownloadLlm: () -> Unit,
     onRequestMic: () -> Unit,
 ) {
@@ -111,7 +115,14 @@ fun ModelSetupScreen(
         Spacer(Modifier.height(24.dp))
 
         Section(title = "Speech") {
-            state.speech.forEach { ModelRowCard(it) }
+            state.speech.forEach { row ->
+                ModelRowCard(
+                    row,
+                    onDownload = if (!row.installed && !row.downloading && !state.busy) {
+                        { onDownloadSpeechModel(row.id) }
+                    } else null,
+                )
+            }
             Spacer(Modifier.height(12.dp))
             val allDone = state.speech.isNotEmpty() && state.speech.all { it.installed }
             OutlinedButton(
@@ -119,7 +130,7 @@ fun ModelSetupScreen(
                 enabled = !state.busy && !allDone,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(if (allDone) "All voices installed" else "Download speech models")
+                Text(if (allDone) "All voices installed" else "Download all missing")
             }
         }
 
@@ -140,12 +151,14 @@ private fun Section(title: String, content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun ModelRowCard(row: ModelRow) {
+private fun ModelRowCard(row: ModelRow, onDownload: (() -> Unit)? = null) {
     Card(
         shape = RoundedCornerShape(16.dp),
         modifier = Modifier
             .fillMaxWidth()
-            .padding(bottom = 8.dp),
+            .padding(bottom = 8.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .then(if (onDownload != null) Modifier.clickable(onClickLabel = "Download ${row.label}", onClick = onDownload) else Modifier),
     ) {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -156,6 +169,13 @@ private fun ModelRowCard(row: ModelRow) {
                         style = MaterialTheme.typography.bodySmall,
                         color = if (row.error != null) MaterialTheme.colorScheme.error
                         else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (onDownload != null) {
+                    Icon(
+                        Icons.Default.Download,
+                        contentDescription = "Tap to download",
+                        tint = MaterialTheme.colorScheme.primary,
                     )
                 }
                 if (row.installed) {

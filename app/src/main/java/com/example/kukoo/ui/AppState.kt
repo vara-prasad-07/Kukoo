@@ -32,6 +32,8 @@ data class SessionState(
     val startedAt: Long = 0,
     /** True once a real speech model is installed; until then tap-to-talk explains the fallback. */
     val micReady: Boolean = false,
+    /** Hold-to-talk by default; when true the assistant listens by itself after every reply. */
+    val handsFree: Boolean = false,
     val hint: String? = null,
     /** Adjustments that make sense for the task the last reply was about. */
     val quickActions: List<QuickAction> = emptyList()
@@ -76,6 +78,8 @@ data class AppState(
     val nextCallAt: Long? = null,
     /** Show the call above the lock screen (only for calls started by the alarm). */
     val overLockscreen: Boolean = false,
+    /** Set when the current call is a reminder for one task; null for the daily / manual call. */
+    val callTaskId: Long? = null,
     /** True while the engine has a change it can still undo. */
     val canUndo: Boolean = false
 )

@@ -29,8 +29,10 @@ class CallForegroundService : Service() {
         handler.removeCallbacks(stopSelfRunnable)
 
         val id = if (session) IncomingCallNotifier.SESSION_NOTIFICATION_ID else IncomingCallNotifier.NOTIFICATION_ID
+        val taskId = intent?.getLongExtra(CallAlarmReceiver.EXTRA_TASK_ID, CallAlarmReceiver.NO_TASK)
+            ?: CallAlarmReceiver.NO_TASK
         val notification = if (session) IncomingCallNotifier.buildSessionNotification(this)
-        else IncomingCallNotifier.buildRingingNotification(this)
+        else IncomingCallNotifier.buildRingingNotification(this, taskId)
 
         try {
             if (Build.VERSION.SDK_INT >= 29) {
@@ -41,7 +43,7 @@ class CallForegroundService : Service() {
         } catch (e: Exception) {
             // e.g. ForegroundServiceStartNotAllowedException: the call must still be announced.
             Log.w(TAG, "Could not go foreground: ${e.message}")
-            if (!session) IncomingCallNotifier.notifyRinging(this)
+            if (!session) IncomingCallNotifier.notifyRinging(this, taskId)
             stopSelf()
             return START_NOT_STICKY
         }
@@ -72,7 +74,8 @@ class CallForegroundService : Service() {
         private const val MODE_SESSION = "session"
 
         /** Starts ringing in the foreground. Returns false when the system refused to start the service. */
-        fun startRinging(context: Context): Boolean = start(context, MODE_RINGING)
+        fun startRinging(context: Context, taskId: Long = CallAlarmReceiver.NO_TASK): Boolean =
+            start(context, MODE_RINGING, taskId)
 
         fun startSession(context: Context): Boolean = start(context, MODE_SESSION)
 
@@ -80,11 +83,13 @@ class CallForegroundService : Service() {
             context.applicationContext.stopService(Intent(context.applicationContext, CallForegroundService::class.java))
         }
 
-        private fun start(context: Context, mode: String): Boolean = try {
+        private fun start(context: Context, mode: String, taskId: Long = CallAlarmReceiver.NO_TASK): Boolean = try {
             val app = context.applicationContext
             ContextCompat.startForegroundService(
                 app,
-                Intent(app, CallForegroundService::class.java).putExtra(EXTRA_MODE, mode)
+                Intent(app, CallForegroundService::class.java)
+                    .putExtra(EXTRA_MODE, mode)
+                    .putExtra(CallAlarmReceiver.EXTRA_TASK_ID, taskId)
             )
             true
         } catch (e: Exception) {

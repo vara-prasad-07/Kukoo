@@ -93,17 +93,26 @@ fun KukooRoot(vm: KukooViewModel) {
             Screen.INCOMING_CALL -> IncomingCallScreen(
                 clock = vm.clock,
                 format = vm.format,
-                onAnswer = vm::answerCall,
+                onAnswer = {
+                    // The call must be able to hear the user, so ask now if the mic was never allowed.
+                    // The session starts either way; listening begins once the grant comes back.
+                    if (!hasMicPermission(context)) micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                    vm.answerCall()
+                },
                 onDecline = vm::declineCall,
-                onSnooze = vm::snoozeCall
+                onSnooze = vm::snoozeCall,
+                reminderTitle = state.callTaskId?.let { id -> state.tasks.firstOrNull { it.id == id }?.title },
+                snoozeLabel = if (state.callTaskId != null) "Snooze 5m" else "Snooze 15m"
             )
 
             Screen.SESSION -> VoiceSessionScreen(
                 session = state.session,
                 clock = vm.clock,
                 onSend = vm::submitText,
+                onMicTap = vm::onMicTap,
                 onMicPress = vm::onMicPress,
                 onMicRelease = vm::onMicRelease,
+                onToggleHandsFree = { vm.setHandsFree(!state.session.handsFree) },
                 onEnd = vm::endCall,
                 canUndo = state.canUndo,
                 events = vm.events,
@@ -122,7 +131,8 @@ fun KukooRoot(vm: KukooViewModel) {
             Screen.SETUP -> ModelSetupScreen(
                 state = state.setup,
                 onBack = vm::closeModelSetup,
-                onDownloadSpeech = vm::downloadSpeechModels,
+                onDownloadSpeech = { vm.downloadSpeechModels() },
+                onDownloadSpeechModel = vm::downloadSpeechModel,
                 onDownloadLlm = vm::downloadLlm,
                 onRequestMic = { micPermission.launch(Manifest.permission.RECORD_AUDIO) }
             )
@@ -135,8 +145,8 @@ fun KukooRoot(vm: KukooViewModel) {
                 editor = editor,
                 format = vm.format,
                 clock = vm.clock,
-                onSave = { title, deadline, duration, priority, notes, recurrence ->
-                    vm.saveEditor(title, deadline, duration, priority, notes, recurrence)
+                onSave = { title, deadline, duration, priority, notes, recurrence, reminder ->
+                    vm.saveEditor(title, deadline, duration, priority, notes, recurrence, reminder)
                 },
                 onDismiss = vm::closeEditor
             )

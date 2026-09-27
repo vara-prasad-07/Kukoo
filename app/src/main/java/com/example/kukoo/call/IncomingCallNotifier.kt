@@ -28,24 +28,25 @@ object IncomingCallNotifier {
 
     /** Returns false when notifications are not allowed, so nothing could be shown. */
     @SuppressLint("MissingPermission")
-    fun show(context: Context): Boolean {
+    fun show(context: Context, taskId: Long = CallAlarmReceiver.NO_TASK): Boolean {
         val app = context.applicationContext
         if (!canNotify(app)) return false
         // Preferred: a foreground service whose notification is this call (keeps the process alive on
         // aggressive OEMs). If the system won't start it, post the notification directly.
-        if (!CallForegroundService.startRinging(app)) notifyRinging(app)
+        if (!CallForegroundService.startRinging(app, taskId)) notifyRinging(app, taskId)
         return true
     }
 
     /** Posts the ringing notification without a service. */
     @SuppressLint("MissingPermission")
-    fun notifyRinging(context: Context) {
+    fun notifyRinging(context: Context, taskId: Long = CallAlarmReceiver.NO_TASK) {
         val app = context.applicationContext
         if (!canNotify(app)) return
-        NotificationManagerCompat.from(app).notify(NOTIFICATION_ID, buildRingingNotification(app))
+        NotificationManagerCompat.from(app).notify(NOTIFICATION_ID, buildRingingNotification(app, taskId))
     }
 
-    fun buildRingingNotification(context: Context): android.app.Notification {
+    /** [taskId] is the task a reminder call is about; the launched activity reads it to brief on that task only. */
+    fun buildRingingNotification(context: Context, taskId: Long = CallAlarmReceiver.NO_TASK): android.app.Notification {
         val app = context.applicationContext
         ensureChannel(app)
 
@@ -53,6 +54,7 @@ object IncomingCallNotifier {
             app, 0,
             Intent(app, MainActivity::class.java)
                 .setAction(ACTION_INCOMING_CALL)
+                .putExtra(CallAlarmReceiver.EXTRA_TASK_ID, taskId)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )

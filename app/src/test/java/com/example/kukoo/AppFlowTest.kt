@@ -2,6 +2,7 @@ package com.example.kukoo
 
 import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
+import com.example.kukoo.ai.RuleBasedIntentParser
 import com.example.kukoo.data.SqliteTaskStore
 import com.example.kukoo.domain.Outcome
 import com.example.kukoo.domain.Priority
@@ -25,8 +26,10 @@ import java.time.Instant
 import java.time.LocalDate
 
 /**
- * End-to-end on the JVM with the real ViewModel, real SQLite (via Robolectric), the real engine
- * and the rule parser: the same path a typed or tapped request takes in the voice session.
+ * End-to-end on the JVM with the real ViewModel, real SQLite (via Robolectric) and the real
+ * engine. Understanding is the NPU model's job in the app and there is no NPU here, so a
+ * deterministic parser is injected: what these tests cover is the engine, the dialog and the
+ * ViewModel, not how an utterance is understood (that is LlamaIntentParserTest).
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], application = KukooApp::class)
@@ -36,7 +39,7 @@ class AppFlowTest {
     /** Every test runs at 3 PM on a fixed day, so "due today" / "tomorrow" never depend on the wall clock. */
     private val clock = clockAt(15)
 
-    private fun newVm(): KukooViewModel = KukooViewModel(app.also { it.container = AppContainer(it, clock) }).also { vm ->
+    private fun newVm(): KukooViewModel = KukooViewModel(app.also { it.container = AppContainer(it, clock, RuleBasedIntentParser()) }).also { vm ->
         await("seed data loaded") { vm.state.value.loaded && vm.state.value.tasks.size == 5 }
     }
 
@@ -130,11 +133,12 @@ class AppFlowTest {
         vm.say("Delete the expense task", "Done. I deleted Expense report.")
         assertTrue(vm.state.value.tasks.none { it.title == "Expense report" })
 
-        // A new task is only added once it has a name, a deadline, a duration and a priority.
+        // A new task is only added once it has a name, a deadline, a duration, a priority and a reminder answer.
         vm.say("Add a task: finish the report tomorrow at 5")
         assertTrue(vm.state.value.tasks.none { it.title == "Finish the report" })
         vm.say("45 minutes")
         vm.say("high")
+        vm.say("no reminder")
         assertNotNull(vm.task("Finish the report").deadline)
 
         // Everything above is really in the database, not just in memory.
@@ -217,12 +221,20 @@ class AppFlowTest {
         vm.say("half an hour", "Got it: 30 minutes. Is Call mom high, medium or low priority?")
         assertEquals(before, vm.state.value.tasks.size)
 
-        vm.say("medium")
+        vm.say(
+            "medium",
+            "Got it: medium priority. Do you want a reminder call before Call mom? " +
+                "I can call you 30, 15 or 10 minutes before, or say none."
+        )
+        assertEquals(before, vm.state.value.tasks.size)
+
+        vm.say("10 minutes before")
         assertEquals(before + 1, vm.state.value.tasks.size)
         val saved = vm.task("Call mom")
         assertEquals(millis(TOMORROW, 18), saved.deadline)
         assertEquals(30, saved.durationMin)
         assertEquals(Priority.MEDIUM, saved.priority)
+        assertEquals(10, saved.reminderMin)
         assertTrue(vm.state.value.session.turns.last().text.endsWith("Medium priority."))
         assertTrue(vm.state.value.canUndo)
     }
@@ -236,7 +248,9 @@ class AppFlowTest {
         assertTrue(vm.state.value.session.turns.last().text.endsWith("Back to Call mom. How long will Call mom take?"))
         vm.say("20 minutes")
         vm.say("low")
+        vm.say("none")
         assertEquals(20, vm.task("Call mom").durationMin)
+        assertNull(vm.task("Call mom").reminderMin)
     }
 
     @Test
@@ -339,6 +353,7 @@ class AppFlowTest {
         assertFalse("still asking, so nothing was added to undo", vm.state.value.canUndo)
         vm.say("20 minutes")
         vm.say("low")
+        vm.say("none")
         assertTrue(vm.state.value.canUndo)
         val actions = vm.state.value.session.quickActions
         assertEquals(listOf("+1 Hour", "Tomorrow 9 AM", "Snooze 15m"), actions.map { it.label })

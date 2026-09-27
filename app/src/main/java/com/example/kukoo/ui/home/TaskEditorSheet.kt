@@ -47,6 +47,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.example.kukoo.domain.Priority
 import com.example.kukoo.domain.Recurrence
@@ -76,7 +77,8 @@ fun TaskEditorSheet(
         durationMin: Int,
         priority: Priority,
         notes: String?,
-        recurrence: Recurrence
+        recurrence: Recurrence,
+        reminderMin: Int?
     ) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -89,8 +91,17 @@ fun TaskEditorSheet(
     var priority by rememberSaveable(existing?.id) { mutableStateOf(existing?.priority ?: Priority.MEDIUM) }
     var notes by rememberSaveable(existing?.id) { mutableStateOf(existing?.notes ?: "") }
     var recurrence by rememberSaveable(existing?.id) { mutableStateOf(existing?.recurrence ?: Recurrence.NONE) }
+    var reminder by rememberSaveable(existing?.id) { mutableStateOf(existing?.reminderMin) }
     var pickDate by remember { mutableStateOf(false) }
     var pickTime by remember { mutableStateOf(false) }
+    var pickReminder by remember { mutableStateOf(false) }
+
+    // A reminder counts back from the deadline, so it must still be in the future. An untouched reminder on
+    // an existing task is left alone: only a new or changed pairing can clash with the present time.
+    val now = clock.millis()
+    fun rings(minutes: Int): Long? = Task.reminderTime(deadline, minutes)
+    val reminderChanged = existing == null || reminder != existing.reminderMin || deadline != existing.deadline
+    val reminderClash = reminderChanged && reminder?.let { m -> rings(m)?.let { it <= now } } == true
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -133,9 +144,50 @@ fun TaskEditorSheet(
                             label = { Text(format.clockTime(current)) },
                             leadingIcon = { Icon(Icons.Default.Schedule, contentDescription = null) }
                         )
-                        IconButton(onClick = { deadline = null }) {
+                        IconButton(onClick = { deadline = null; reminder = null }) {
                             Icon(Icons.Default.Close, contentDescription = "Remove deadline")
                         }
+                    }
+                }
+            }
+
+            Field("Reminder call") {
+                val due = deadline
+                if (due == null) {
+                    Text(
+                        "Add a deadline to get a call before it.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = reminder == null,
+                            onClick = { reminder = null },
+                            label = { Text("None") }
+                        )
+                        val custom = reminder?.takeIf { it !in Task.REMINDER_PRESETS_MIN }
+                        (Task.REMINDER_PRESETS_MIN + listOfNotNull(custom)).forEach { minutes ->
+                            FilterChip(
+                                selected = minutes == reminder,
+                                onClick = { reminder = minutes },
+                                // Greyed out when the call would ring before now, so a clash cannot be picked.
+                                enabled = minutes == reminder || (rings(minutes) ?: 0L) > now,
+                                label = { Text(shortDuration(minutes)) }
+                            )
+                        }
+                        AssistChip(onClick = { pickReminder = true }, label = { Text("Custom") })
+                    }
+                    if (reminderClash) {
+                        Text(
+                            "That call would ring at ${format.clockTime(rings(reminder!!)!!)}, which has already passed. " +
+                                "Pick a shorter reminder or a later deadline.",
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
                     }
                 }
             }
@@ -203,11 +255,52 @@ fun TaskEditorSheet(
             ) {
                 TextButton(onClick = onDismiss) { Text("Cancel") }
                 Button(
-                    onClick = { onSave(title, deadline, duration, priority, notes.ifBlank { null }, recurrence) },
-                    enabled = title.isNotBlank()
+                    onClick = {
+                        onSave(
+                            title, deadline, duration, priority, notes.ifBlank { null }, recurrence,
+                            if (deadline == null) null else reminder
+                        )
+                    },
+                    enabled = title.isNotBlank() && !reminderClash
                 ) { Text("Save") }
             }
         }
+    }
+
+    if (pickReminder) {
+        var text by remember { mutableStateOf(reminder?.takeIf { it !in Task.REMINDER_PRESETS_MIN }?.toString() ?: "") }
+        val minutes = text.toIntOrNull()
+        val ringsAt = minutes?.let(::rings)
+        val problem = when {
+            minutes == null -> null
+            minutes !in Task.MIN_REMINDER_MIN..Task.MAX_REMINDER_MIN ->
+                "Choose between ${Task.MIN_REMINDER_MIN} and ${Task.MAX_REMINDER_MIN} minutes."
+            ringsAt != null && ringsAt <= now ->
+                "That call would ring at ${format.clockTime(ringsAt)}, which has already passed."
+            else -> null
+        }
+        AlertDialog(
+            onDismissRequest = { pickReminder = false },
+            title = { Text("Custom reminder") },
+            text = {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { if (it.length <= 4 && it.all(Char::isDigit)) text = it },
+                    label = { Text("Minutes before the deadline") },
+                    singleLine = true,
+                    isError = problem != null,
+                    supportingText = problem?.let { message -> { Text(message) } },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = minutes != null && problem == null,
+                    onClick = { reminder = minutes; pickReminder = false }
+                ) { Text("OK") }
+            },
+            dismissButton = { TextButton(onClick = { pickReminder = false }) { Text("Cancel") } }
+        )
     }
 
     if (pickDate) {

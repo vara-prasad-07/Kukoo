@@ -258,13 +258,20 @@ class LlamaIntentParserTest {
         )
     }
 
+    /**
+     * The model is the only thing that understands the user. When it cannot answer, the assistant
+     * says so; it must never quietly fall back to pattern matching, which is what made every reply
+     * feel templated and hid the fact that the model was not running.
+     */
     @Test
-    fun aBrokenAnswer_orNoModel_fallsBackToTheRuleParser() {
-        assertEquals(TaskCommand.QueryTasks(QueryScope.TODAY), parse("what's due today", "not json at all"))
-        assertEquals(TaskCommand.StartTask(), parse("add a task", "", available = false))
-        // ...which also reads a reply in context, so the dialog still works without the model.
+    fun withoutAUsableAnswer_theAssistantSaysSo_ratherThanGuessing() {
         assertEquals(
-            TaskCommand.FillTask(TaskDraft(priority = Priority.HIGH)),
+            TaskCommand.Unsupported("what's due today"),
+            parse("what's due today", "not json at all")
+        )
+        assertEquals(TaskCommand.NotReady, parse("add a task", "", available = false))
+        assertEquals(
+            TaskCommand.NotReady,
             parse("high", "", ParseContext(draft = withDuration), available = false)
         )
     }
@@ -311,5 +318,115 @@ class LlamaIntentParserTest {
 
         assertTrue(Grounding.recurrenceGrounded("every day"))
         assertFalse(Grounding.recurrenceGrounded("tomorrow"))
+    }
+
+    // ---- the reminder call -----------------------------------------------------------------
+
+    private val readyForReminder = withDuration.copy(priority = Priority.HIGH)
+
+    @Test
+    fun whenTheReminderIsAsked_thePromptSaysSoAndKeepsNumbersOutOfTheDuration() {
+        val prompt = LlamaIntentParser(ScriptedEngine("")).buildPrompt("ten minutes", ParseContext(draft = readyForReminder))
+        assertTrue(prompt.contains("reminder call: missing"))
+        assertTrue(prompt.contains("The assistant just asked the user for the task's reminder call"))
+        assertTrue(prompt.contains("never \"duration_min\""))
+        assertTrue(prompt.contains("does NOT mean cancelling the task"))
+    }
+
+    @Test
+    fun aReminderAnswer_isReadAsMinutesBefore() {
+        val model = """{"action":"answer","reminder_min":10}"""
+        assertEquals(
+            TaskCommand.FillTask(TaskDraft(reminderMin = 10)),
+            parse("ten minutes before", model, ParseContext(draft = readyForReminder))
+        )
+    }
+
+    @Test
+    fun noReminder_isAnAnswer_notACancellation() {
+        val model = """{"action":"answer","reminder_min":0}"""
+        assertEquals(
+            TaskCommand.FillTask(TaskDraft(reminderMin = TaskDraft.NO_REMINDER)),
+            parse("none", model, ParseContext(draft = readyForReminder))
+        )
+    }
+
+    @Test
+    fun aNumberFiledUnderDuration_whileTheReminderIsAsked_isStillTheReminder() {
+        val model = """{"action":"answer","duration_min":10}"""
+        assertEquals(
+            TaskCommand.FillTask(TaskDraft(reminderMin = 10)),
+            parse("10 minutes", model, ParseContext(draft = readyForReminder))
+        )
+    }
+
+    @Test
+    fun aReminderNobodySaid_isNotBelieved() {
+        val ctx = ParseContext(draft = readyForReminder)
+        // "sure" has no number, and "sounds good" has no no-word: neither can have meant a reminder answer.
+        assertEquals(TaskCommand.FillTask(TaskDraft()), parse("sure", """{"action":"answer","reminder_min":15}""", ctx))
+        assertEquals(TaskCommand.FillTask(TaskDraft()), parse("sounds good", """{"action":"answer","reminder_min":0}""", ctx))
+    }
+
+    @Test
+    fun anAnswerToTheReminderQuestion_neverChangesTheDurationOrDeadline() {
+        val model = """{"action":"answer","reminder_min":5,"duration_min":5,"day":"tomorrow","time":"05:00"}"""
+        assertEquals(
+            TaskCommand.FillTask(TaskDraft(reminderMin = 5)),
+            parse("5 minutes before at 5", model, ParseContext(draft = readyForReminder))
+        )
+    }
+
+    @Test
+    fun aReminderSaidWhileAdding_isKept_andIsNotAlsoTheTasksLength() {
+        val model = """{"action":"add_task","title":"gym","day":"tomorrow","time":"18:00","duration_min":15,"reminder_min":15}"""
+        assertEquals(
+            TaskCommand.AddTask("gym", rel(DayRef.Tomorrow, 18), reminderMin = 15),
+            parse("add gym tomorrow at 6 pm remind me 15 minutes before", model)
+        )
+    }
+
+    @Test
+    fun aRealDurationAndAReminderInOneSentence_areBothKept() {
+        val model = """{"action":"add_task","title":"gym","duration_min":60,"reminder_min":10}"""
+        assertEquals(
+            TaskCommand.AddTask("gym", null, 60, reminderMin = 10),
+            parse("add gym for 60 minutes and remind me 10 minutes before", model)
+        )
+    }
+
+    @Test
+    fun aReminderTheUserNeverMentioned_isDroppedFromAnAdd() {
+        val model = """{"action":"add_task","title":"gym","duration_min":30,"reminder_min":30}"""
+        assertEquals(
+            TaskCommand.AddTask("gym", null, 30),
+            parse("add gym for 30 minutes", model)
+        )
+    }
+
+    @Test
+    fun changingOrRemovingAReminderOnAnExistingTask() {
+        val ctx = ParseContext(openTaskTitles = listOf("Gym"))
+        assertEquals(
+            TaskCommand.UpdateTask(TaskRef.ByTitle("Gym"), TaskPatch(reminderMin = 10)),
+            parse("remind me 10 minutes before gym", """{"action":"update_task","target":"Gym","reminder_min":10}""", ctx)
+        )
+        assertEquals(
+            TaskCommand.UpdateTask(TaskRef.ByTitle("Gym"), TaskPatch(clearReminder = true)),
+            parse("remove the reminder from gym", """{"action":"update_task","target":"Gym","reminder_min":0}""", ctx)
+        )
+    }
+
+    @Test
+    fun groundingOfReminders() {
+        assertTrue(Grounding.reminderMinutesGrounded("10 minutes before", bare = false))
+        assertFalse(Grounding.reminderMinutesGrounded("for 30 minutes", bare = false))
+        assertTrue(Grounding.reminderMinutesGrounded("10", bare = true))
+        assertTrue(Grounding.noReminderGrounded("none", bare = true))
+        assertFalse(Grounding.noReminderGrounded("none", bare = false))
+        assertTrue(Grounding.noReminderGrounded("no reminder please", bare = false))
+        assertTrue(Grounding.noReminderGrounded("remove the reminder", bare = false))
+        assertEquals(2, Grounding.durationPhraseCount("30 minutes and 10 minutes before"))
+        assertEquals(1, Grounding.durationPhraseCount("remind me an hour before at 6 am"))
     }
 }

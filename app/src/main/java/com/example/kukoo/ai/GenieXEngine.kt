@@ -290,6 +290,11 @@ class GenieXEngine(context: Context) : LlamaEngine {
         imagePaths: List<String> = emptyList(),
     ): String = generateLock.withLock {
         val wrapper = vlm ?: throw IllegalStateException("Model not loaded")
+        // Each parse is an independent classification, not a continuation of the last one: the
+        // conversation the model should see is built into the prompt. Without this the dialog's
+        // KV cache carried the previous turns over and the model answered a stale question —
+        // "thank you" came back as the query from two turns earlier, then repeated itself.
+        runCatching { wrapper.reset() }.onFailure { Log.w(TAG, "reset failed", it) }
         // The parser hands us a ChatML string. Re-splitting it into messages and letting the model
         // apply its own template is what makes <|im_start|> land as real special tokens: a raw
         // prompt string would be tokenized as literal text and quality would quietly drop.
@@ -345,13 +350,21 @@ class GenieXEngine(context: Context) : LlamaEngine {
      * in that shape, and the caller then sends it unchanged.
      */
     private fun asChatMessages(prompt: String, imagePaths: List<String>): Array<VlmChatMessage>? {
-        val system = CHATML.find(prompt, "system") ?: return null
-        val user = CHATML.find(prompt, "user") ?: return null
-        val userContents = imagePaths.map { VlmContent("image", it) } + VlmContent("text", user)
-        return arrayOf(
-            VlmChatMessage(role = "system", contents = listOf(VlmContent("text", system))),
-            VlmChatMessage(role = "user", contents = userContents),
-        )
+        // Every turn, in order. Taking only the first system and first user block (as this did
+        // before conversation history was added) handed the model an *earlier* turn instead of
+        // what the user had just said, so it kept answering a stale question.
+        val turns = CHATML.all(prompt)
+        if (turns.none { it.first == "system" } || turns.none { it.first == "user" }) return null
+        val lastUser = turns.indexOfLast { it.first == "user" }
+        return turns.mapIndexed { index, (role, text) ->
+            // Images belong to the turn being asked about, which is the final user turn.
+            val contents = if (index == lastUser) {
+                imagePaths.map { VlmContent("image", it) } + VlmContent("text", text)
+            } else {
+                listOf(VlmContent("text", text))
+            }
+            VlmChatMessage(role = role, contents = contents)
+        }.toTypedArray()
     }
 
     /**
@@ -399,14 +412,15 @@ class GenieXEngine(context: Context) : LlamaEngine {
          */
         private val COMPUTE_UNIT: String? = null
 
-        /** Pulls one `<|im_start|>role … <|im_end|>` block out of a ChatML prompt. */
+        /** Pulls every `<|im_start|>role … <|im_end|>` block out of a ChatML prompt, in order. */
         private object CHATML {
-            fun find(prompt: String, role: String): String? =
-                Regex("<\\|im_start\\|>$role\\n(.*?)<\\|im_end\\|>", RegexOption.DOT_MATCHES_ALL)
-                    .find(prompt)
-                    ?.groupValues
-                    ?.get(1)
-                    ?.trim()
+            private val BLOCK = Regex(
+                "<\\|im_start\\|>(system|user|assistant)\\n(.*?)<\\|im_end\\|>",
+                RegexOption.DOT_MATCHES_ALL,
+            )
+
+            fun all(prompt: String): List<Pair<String, String>> =
+                BLOCK.findAll(prompt).map { it.groupValues[1] to it.groupValues[2].trim() }.toList()
         }
     }
 }

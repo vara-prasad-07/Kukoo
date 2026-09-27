@@ -7,6 +7,7 @@ import android.content.Intent
 import android.os.Build
 import androidx.core.content.edit
 import com.example.kukoo.MainActivity
+import com.example.kukoo.domain.Task
 import java.time.Clock
 import java.time.LocalDate
 import java.time.LocalDateTime
@@ -64,8 +65,38 @@ class CallScheduler(context: Context, private val clock: Clock) {
         arm(REQUEST_DEMO, clock.millis() + seconds * 1000L, daily = false)
     }
 
-    private fun arm(requestCode: Int, atMillis: Long, daily: Boolean) {
-        val operation = operation(requestCode, daily)
+    /**
+     * Brings the per-task reminder alarms in line with [tasks]: every open task with a reminder still
+     * in the future gets exactly one alarm (re-armed in place if its time changed), and alarms of
+     * tasks that were deleted, finished or lost their reminder are cancelled.
+     */
+    fun syncReminders(tasks: List<Task>) {
+        val now = clock.millis()
+        val wanted = tasks.mapNotNull { t ->
+            val at = t.reminderAt
+            if (!t.isDone && at != null && at > now) t.id to at else null
+        }.toMap()
+        val armed = prefs.getStringSet(KEY_ARMED, emptySet()).orEmpty().mapNotNull { it.toLongOrNull() }.toSet()
+        (armed - wanted.keys).forEach { alarms.cancel(operation(reminderRequest(it), daily = false, taskId = it)) }
+        wanted.forEach { (id, at) -> arm(reminderRequest(id), at, daily = false, taskId = id) }
+        prefs.edit { putStringSet(KEY_ARMED, wanted.keys.map { it.toString() }.toSet()) }
+    }
+
+    /** Called when a reminder rings: its alarm is spent, so it no longer needs cancelling later. */
+    fun reminderFired(taskId: Long) {
+        val armed = prefs.getStringSet(KEY_ARMED, emptySet()).orEmpty()
+        prefs.edit { putStringSet(KEY_ARMED, armed - taskId.toString()) }
+    }
+
+    /** Rings the reminder for [taskId] again in [minutes] (the call's Snooze button). */
+    fun snoozeReminder(taskId: Long, minutes: Int) {
+        arm(reminderRequest(taskId), clock.millis() + minutes * 60_000L, daily = false, taskId = taskId)
+    }
+
+    private fun reminderRequest(taskId: Long): Int = REQUEST_REMINDER_BASE + (taskId % REMINDER_ID_SPAN).toInt()
+
+    private fun arm(requestCode: Int, atMillis: Long, daily: Boolean, taskId: Long = NO_TASK) {
+        val operation = operation(requestCode, daily, taskId)
         val canBeExact = Build.VERSION.SDK_INT < 31 || alarms.canScheduleExactAlarms()
         if (canBeExact) {
             val show = PendingIntent.getActivity(
@@ -89,11 +120,14 @@ class CallScheduler(context: Context, private val clock: Clock) {
         alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, atMillis, operation)
     }
 
-    private fun operation(requestCode: Int, daily: Boolean): PendingIntent =
+    // Extras are ignored when PendingIntents are matched, so every task needs its own request code.
+    private fun operation(requestCode: Int, daily: Boolean, taskId: Long = NO_TASK): PendingIntent =
         PendingIntent.getBroadcast(
             context,
             requestCode,
-            Intent(context, CallAlarmReceiver::class.java).putExtra(CallAlarmReceiver.EXTRA_DAILY, daily),
+            Intent(context, CallAlarmReceiver::class.java)
+                .putExtra(CallAlarmReceiver.EXTRA_DAILY, daily)
+                .putExtra(CallAlarmReceiver.EXTRA_TASK_ID, taskId),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
@@ -101,7 +135,11 @@ class CallScheduler(context: Context, private val clock: Clock) {
         const val KEY_ENABLED = "daily_enabled"
         const val KEY_HOUR = "daily_hour"
         const val KEY_MINUTE = "daily_minute"
+        const val KEY_ARMED = "armed_reminders"
         const val REQUEST_DAILY = 1
         const val REQUEST_DEMO = 2
+        const val NO_TASK = CallAlarmReceiver.NO_TASK
+        const val REQUEST_REMINDER_BASE = 1_000
+        const val REMINDER_ID_SPAN = 1_000_000L
     }
 }

@@ -32,7 +32,7 @@ and nothing else to untangle. `app/src/main/java/com/example/kukoo/ai/AiSeams.kt
 
 ```kotlin
 interface IntentParser  { suspend fun parse(utterance: String, context: ParseContext): TaskCommand }
-interface SpeechToText  { val isReady: Boolean; suspend fun startListening(); suspend fun stopAndTranscribe(): String }
+interface SpeechToText  { val isReady: Boolean; suspend fun listen(onCaptured: () -> Unit = {}): String }
 interface Speaker       { suspend fun speak(text: String); fun stop() }
 ```
 
@@ -298,3 +298,30 @@ Pre-committed calls, so you don't burn time deliberating at 3 a.m.
 - [Qwen2.5-VL-7B on a Qualcomm board — the 7.7 tok/s figure](https://www.macnica.co.jp/en/business/semiconductor/articles/qualcomm/150066/)
 - [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — STT + TTS, Android AAR
 - [Whisper-Small-En on AI Hub](https://aihub.qualcomm.com/mobile/models/whisper_small_en) — the rejected alternative
+
+---
+
+## 10. Adding a task by conversation (implemented)
+
+A spoken or typed "add" needs **a name, a deadline, a duration and a priority**. The assistant asks for
+whatever is missing, one question at a time, and nothing is saved until all four are known.
+(Forms are unchanged: they still add immediately with defaults.)
+
+```
+you:  add                       →  What should I call the task?
+you:  call mom                  →  Got it: Call mom. When is Call mom due?
+you:  tomorrow at 6             →  Got it: due tomorrow at 6 PM. How long will Call mom take?
+you:  half an hour              →  Got it: 30 minutes. Is Call mom high, medium or low priority?
+you:  high                      →  Added Call mom, due tomorrow at 6 PM, 30 minutes. High priority.
+```
+
+- **Everything said in one sentence is added at once**; a partial sentence is only asked for what is missing.
+- **Mid-question** you can ask something else ("what's due today" is answered, then "Back to Call mom. …"),
+  say "never mind" to drop it, or start a different task (the old one is dropped, and it says so).
+- **No canned examples.** The few-shot tasks are gone from the prompt. The bare "add" bug is prevented in
+  code as well: `ai/Grounding.kt` drops any name, time, duration or priority the model returns that the
+  user's own words do not support, so the assistant asks instead of inventing.
+- **Verified on the iQOO 15** with the real model (`raw=` output in logcat): the model tried to fill in
+  `duration_min: 30, priority: medium` for "add water plants every day at 8 am" and answered "i dont know"
+  with `duration_min: 90`; both were dropped and the question was asked again.
+- The dialog also works without the NPU: the rule parser reads replies in context (`parseReply`).

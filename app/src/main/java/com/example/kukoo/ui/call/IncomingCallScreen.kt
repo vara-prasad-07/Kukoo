@@ -63,7 +63,10 @@ fun IncomingCallScreen(
     format: TimeFormat,
     onAnswer: () -> Unit,
     onDecline: () -> Unit,
-    onSnooze: () -> Unit = {}
+    onSnooze: () -> Unit = {},
+    /** Set for a task reminder: the call is about this one task. */
+    reminderTitle: String? = null,
+    snoozeLabel: String = "Snooze 15m"
 ) {
     LightSystemBarIcons()
 
@@ -104,7 +107,11 @@ fun IncomingCallScreen(
             Spacer(Modifier.height(28.dp))
             Text("Your Tasks", style = MaterialTheme.typography.headlineMedium, color = Color.White)
             Spacer(Modifier.height(6.dp))
-            Text("Incoming call…", style = MaterialTheme.typography.bodyLarge, color = Color.White.copy(alpha = 0.7f))
+            Text(
+                if (reminderTitle != null) "Reminder: $reminderTitle" else "Incoming call…",
+                style = MaterialTheme.typography.bodyLarge,
+                color = Color.White.copy(alpha = 0.7f)
+            )
 
             Spacer(Modifier.weight(1.2f))
 
@@ -115,7 +122,7 @@ fun IncomingCallScreen(
                 horizontalArrangement = Arrangement.SpaceEvenly
             ) {
                 CallButton(CallDecline, Icons.Default.CallEnd, "Decline", onDecline)
-                CallButton(Indigo40, Icons.Default.Snooze, "Snooze 15m", onSnooze)
+                CallButton(Indigo40, Icons.Default.Snooze, snoozeLabel, onSnooze)
                 CallButton(CallAnswer, Icons.Default.Call, "Answer", onAnswer)
             }
         }

@@ -22,8 +22,9 @@ import org.junit.Test
 import java.time.LocalTime
 
 /**
- * Adding a task by voice needs a name, a deadline, a duration and a priority. Until all four are
- * known the assistant asks for the next one and nothing is written to the store.
+ * Adding a task by voice needs a name, a deadline, a duration, a priority and an answer about the
+ * reminder call (a number of minutes, or none). Until all five are known the assistant asks for the
+ * next one and nothing is written to the store.
  */
 class AddTaskDialogTest {
     private class Rig(val store: FakeStore, val engine: TaskEngine)
@@ -52,7 +53,7 @@ class AddTaskDialogTest {
     }
 
     @Test
-    fun theTaskIsOnlyAddedOnceAllFourDetailsAreKnown() {
+    fun theTaskIsOnlyAddedOnceAllDetailsAreKnown() {
         val r = rig()
         r.say(TaskCommand.StartTask())
 
@@ -68,17 +69,89 @@ class AddTaskDialogTest {
         assertEquals("Got it: 30 minutes. Is Call mom high, medium or low priority?", afterLength.spoken)
         assertTrue(r.store.all().isEmpty())
 
-        val done = r.fill(TaskDraft(priority = Priority.HIGH))
+        val afterPriority = r.fill(TaskDraft(priority = Priority.HIGH))
+        assertEquals(Outcome.NEEDS_INFO, afterPriority.outcome)
+        assertEquals(
+            "Got it: high priority. Do you want a reminder call before Call mom? " +
+                "I can call you 30, 15 or 10 minutes before, or say none.",
+            afterPriority.spoken
+        )
+        assertTrue(r.store.all().isEmpty())
+
+        val done = r.fill(TaskDraft(reminderMin = 15))
         assertEquals(Outcome.OK, done.outcome)
-        assertEquals("Added Call mom, due tomorrow at 6 PM, 30 minutes. High priority.", done.spoken)
+        assertEquals(
+            "Added Call mom, due tomorrow at 6 PM, 30 minutes. I'll call you 15 minutes before. High priority.",
+            done.spoken
+        )
 
         val saved = r.store.all().single()
         assertEquals("Call mom", saved.title)
         assertEquals(tomorrow(18), saved.deadline)
         assertEquals(30, saved.durationMin)
         assertEquals(Priority.HIGH, saved.priority)
+        assertEquals(15, saved.reminderMin)
         assertNull(r.engine.pendingDraft)
         assertEquals(listOf(saved.id), done.taskIds)
+    }
+
+    @Test
+    fun answeringNone_addsTheTaskWithoutAReminder() {
+        val r = rig()
+        r.say(TaskCommand.AddTask("call mom", tomorrowAt(18), 30, Priority.HIGH))
+        val done = r.fill(TaskDraft(reminderMin = TaskDraft.NO_REMINDER))
+        assertEquals(Outcome.OK, done.outcome)
+        assertEquals("Added Call mom, due tomorrow at 6 PM, 30 minutes. High priority.", done.spoken)
+        assertNull(r.store.all().single().reminderMin)
+    }
+
+    @Test
+    fun theReminderSuggestions_onlyOfferTimesThatFitBeforeTheDeadline() {
+        val r = rig() // 3 PM
+        val res = r.say(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(today(15, 12)), 30, Priority.HIGH))
+        assertEquals(Outcome.NEEDS_INFO, res.outcome)
+        assertTrue(res.spoken, res.spoken.endsWith("I can call you 10, 5 or 3 minutes before, or say none."))
+    }
+
+    @Test
+    fun aReminderTheUserAsksFor_thatWouldRingBeforeNow_isRefusedAndAskedAgain() {
+        val r = rig()
+        r.say(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(today(15, 12)), 30, Priority.HIGH))
+        val res = r.fill(TaskDraft(reminderMin = 30))
+        assertEquals(Outcome.NEEDS_INFO, res.outcome)
+        assertTrue(res.spoken, res.spoken.contains("has already passed"))
+        assertTrue(res.spoken, res.spoken.contains("Do you want a reminder call before Gym?"))
+        assertNull(r.engine.pendingDraft?.reminderMin)
+        assertTrue(r.store.all().isEmpty())
+    }
+
+    @Test
+    fun aDeadlineTooCloseForAnyReminder_skipsTheQuestionAndSaysSo() {
+        val r = rig()
+        val res = r.say(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(today(15, 2)), 30, Priority.HIGH))
+        assertEquals(Outcome.OK, res.outcome)
+        assertTrue(res.spoken, res.spoken.endsWith("There isn't enough time before the deadline for a reminder call."))
+        assertNull(r.store.all().single().reminderMin)
+    }
+
+    @Test
+    fun aReminderGivenUpFront_isKeptAndNotAskedAgain() {
+        val r = rig()
+        val res = r.say(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(today(18)), 30, Priority.HIGH, reminderMin = 10))
+        assertEquals(Outcome.OK, res.outcome)
+        assertTrue(res.spoken, res.spoken.contains("I'll call you 10 minutes before."))
+        assertEquals(10, r.store.all().single().reminderMin)
+    }
+
+    @Test
+    fun aReminderGivenBeforeTheDeadline_isCheckedOnceTheDeadlineArrives() {
+        val r = rig()
+        r.say(TaskCommand.AddTask("Gym", reminderMin = 30))
+        assertEquals(30, r.engine.pendingDraft?.reminderMin)
+        val res = r.fill(TaskDraft(deadline = DeadlineSpec.Exact(today(15, 12))))
+        assertEquals(Outcome.NEEDS_INFO, res.outcome)
+        assertTrue(res.spoken, res.spoken.contains("has already passed"))
+        assertNull(r.engine.pendingDraft?.reminderMin)
     }
 
     @Test
@@ -98,7 +171,12 @@ class AddTaskDialogTest {
     fun oneReplyCanAnswerSeveralQuestionsAtOnce() {
         val r = rig()
         r.say(TaskCommand.AddTask("send invoice"))
-        val res = r.fill(TaskDraft(deadline = tomorrowAt(10), durationMin = 20, priority = Priority.LOW))
+        val res = r.fill(
+            TaskDraft(
+                deadline = tomorrowAt(10), durationMin = 20, priority = Priority.LOW,
+                reminderMin = TaskDraft.NO_REMINDER
+            )
+        )
         assertEquals(Outcome.OK, res.outcome)
         assertTrue(res.spoken, res.spoken.endsWith("Low priority."))
         val saved = r.store.all().single()
@@ -122,7 +200,7 @@ class AddTaskDialogTest {
     @Test
     fun aRepeatIsKeptButNeverAskedFor() {
         val r = rig()
-        val res = r.say(TaskCommand.AddTask("water plants", tomorrowAt(9), 15, Priority.LOW, Recurrence.DAILY))
+        val res = r.say(TaskCommand.AddTask("water plants", tomorrowAt(9), 15, Priority.LOW, Recurrence.DAILY, reminderMin = TaskDraft.NO_REMINDER))
         assertEquals(Outcome.OK, res.outcome)
         assertEquals(Recurrence.DAILY, r.store.all().single().recurrence)
     }

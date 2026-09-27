@@ -42,14 +42,28 @@ data class TaskPatch(
     val priority: Priority? = null,
     val recurrence: Recurrence? = null,
     /** Blank clears the notes. */
-    val notes: String? = null
+    val notes: String? = null,
+    val reminderMin: Int? = null,
+    val clearReminder: Boolean = false
 ) {
     val isEmpty: Boolean
         get() = title == null && deadline == null && !clearDeadline && durationMin == null && priority == null &&
-            recurrence == null && notes == null
+            recurrence == null && notes == null && reminderMin == null && !clearReminder
 }
 
 enum class QueryScope { TODAY, ALL_OPEN }
+
+/** The kinds of non-task talk the assistant recognises and answers naturally. */
+enum class ChatKind {
+    /** "hi", "hello", "good morning" */
+    GREETING,
+    /** "thanks", "thank you" */
+    THANKS,
+    /** "okay", "yeah", "got it", "sure" — the user is acknowledging, not asking for anything. */
+    ACKNOWLEDGE,
+    /** "what can you do", "help" */
+    HELP
+}
 
 enum class PlanScope(val label: String) {
     AFTERNOON("afternoon"),
@@ -69,7 +83,9 @@ sealed interface TaskCommand {
         val durationMin: Int? = null,
         val priority: Priority? = null,
         val recurrence: Recurrence = Recurrence.NONE,
-        val notes: String? = null
+        val notes: String? = null,
+        /** Minutes before the deadline to phone about this task; null for no reminder. */
+        val reminderMin: Int? = null
     ) : TaskCommand
 
     /**
@@ -95,11 +111,30 @@ sealed interface TaskCommand {
 
     data object EndCall : TaskCommand
 
+    /**
+     * The user named a task to change but not what to change about it ("modify the gym"). The
+     * assistant asks, rather than guessing or refusing — guessing is what turned a misheard
+     * "modify the gym" into a new task called "Mortify the gym".
+     */
+    data class AskWhatToChange(val ref: TaskRef) : TaskCommand
+
+    /**
+     * Conversation that is not a task command. A real assistant answers "thanks" and "hello"
+     * instead of reciting the list of things it can do.
+     */
+    data class Chat(val kind: ChatKind) : TaskCommand
+
     /** Reverts the most recent change made by add / update / complete / reopen / delete. */
     data object Undo : TaskCommand
 
     /** The utterance did not map to a supported command. */
     data class Unsupported(val heard: String) : TaskCommand
+
+    /**
+     * The on-device model is not resident yet, so nothing has understood the request. Understanding
+     * is the model's job alone, so the assistant says so plainly rather than guessing with patterns.
+     */
+    data object NotReady : TaskCommand
 }
 
 enum class Outcome {

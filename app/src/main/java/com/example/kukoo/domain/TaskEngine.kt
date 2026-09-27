@@ -71,11 +71,46 @@ class TaskEngine(
         TaskCommand.Undo -> undo()
         is TaskCommand.Snooze -> snooze(command.minutes)
         TaskCommand.EndCall -> EngineResult(Outcome.END_CALL, "Okay, goodbye. Your tasks are up to date.")
-        is TaskCommand.Unsupported -> EngineResult(
-            Outcome.UNSUPPORTED,
-            "Sorry, I didn't catch a task command. You can ask what's due today, add, move, " +
-                "finish or delete a task, or say replan my afternoon."
+        is TaskCommand.AskWhatToChange -> askWhatToChange(command.ref)
+        is TaskCommand.Chat -> chat(command.kind)
+        is TaskCommand.Unsupported -> EngineResult(Outcome.UNSUPPORTED, CAPABILITIES)
+        TaskCommand.NotReady -> EngineResult(
+            Outcome.REJECTED,
+            "I'm still getting the on-device model ready. Give me a few seconds and say that again.",
         )
+    }
+
+    /** "Change the gym" — the task is clear, the change is not, so ask instead of guessing. */
+    private fun askWhatToChange(ref: TaskRef): EngineResult {
+        val task = when (val r = resolve(ref, prefer = { !it.isDone })) {
+            is Resolved.Ok -> r.task
+            is Resolved.Fail -> return r.result
+        }
+        lastTaskId = task.id
+        val when_ = task.deadline?.let { " It is due ${format.deadline(it)}." }.orEmpty()
+        return EngineResult(
+            Outcome.NEEDS_INFO,
+            "What would you like to change about ${task.title}?$when_ " +
+                "You can move it to another time, change how long it takes, or change its priority.",
+            taskIds = listOf(task.id)
+        )
+    }
+
+    private fun chat(kind: ChatKind): EngineResult {
+        val pending = draft
+        val message = when (kind) {
+            ChatKind.GREETING -> "${format.greeting()}. What would you like to do?"
+            ChatKind.THANKS -> "You're welcome."
+            ChatKind.ACKNOWLEDGE -> "Okay."
+            ChatKind.HELP -> CAPABILITIES
+        }
+        // Mid-dialog the question still needs answering, so repeat it after the pleasantry.
+        if (pending != null && kind != ChatKind.HELP) return ask(pending, prefix = "$message ")
+        val tail = when (kind) {
+            ChatKind.THANKS, ChatKind.ACKNOWLEDGE -> " Anything else?"
+            else -> ""
+        }
+        return EngineResult(Outcome.OK, message + tail)
     }
 
     private suspend fun dispatchSpoken(command: TaskCommand): EngineResult {
@@ -85,7 +120,9 @@ class TaskEngine(
             // A misheard "gym every day at 12pm" is still a new task, and needs the same questions.
             is TaskCommand.UpdateTask ->
                 selfHealToAdd(command)?.let { startDraft(TaskDraft.of(it)) } ?: withDraftReminder(command)
-            is TaskCommand.StartTask, is TaskCommand.FillTask, TaskCommand.DiscardDraft -> dispatch(command)
+            // chat() re-asks the pending question itself, so it must not also get a draft reminder.
+            is TaskCommand.StartTask, is TaskCommand.FillTask, TaskCommand.DiscardDraft,
+            is TaskCommand.Chat -> dispatch(command)
             is TaskCommand.Unsupported ->
                 if (pending != null) ask(pending, prefix = "Sorry, I didn't catch that. ") else dispatch(command)
             TaskCommand.EndCall -> {
@@ -109,6 +146,44 @@ class TaskEngine(
             " That is about ${format.duration(roundToFive(workload))} of work."
         } else ""
         return "${format.greeting()}. $core$extra What would you like to do?"
+    }
+
+    /**
+     * Spoken opening of a reminder call: only the task the reminder is for, never the rest of the list.
+     * Null when that task no longer needs a call (deleted or already done).
+     */
+    fun taskBriefing(taskId: Long): String? {
+        val task = store.get(taskId)?.takeIf { !it.isDone } ?: return null
+        lastTaskId = task.id
+        val now = clock.millis()
+        val deadline = task.deadline
+        val lead = when {
+            deadline == null -> "Reminder: ${task.title}."
+            deadline > now -> {
+                val left = ((deadline - now + MILLIS_PER_MINUTE - 1) / MILLIS_PER_MINUTE).toInt()
+                "Reminder: ${task.title} is due ${format.deadline(deadline)}, in ${spanWord(left)}."
+            }
+            else -> "Reminder: ${task.title} was due ${format.deadline(deadline)}."
+        }
+        val notes = task.notes?.let { " Your note says: $it." }.orEmpty()
+        return "$lead It takes ${format.duration(task.durationMin)}, ${task.priority.label.lowercase()} priority.$notes " +
+            "Want to mark it done, move it, or change something?"
+    }
+
+    private fun spanWord(minutes: Int) = if (minutes < 60) format.minutes(minutes) else format.duration(minutes)
+
+    /** Why [reminderMin] cannot be used for a task due at [deadline], or null when it is fine. */
+    private fun reminderError(title: String, deadline: Long?, reminderMin: Int, now: Long): String? {
+        if (reminderMin < Task.MIN_REMINDER_MIN || reminderMin > Task.MAX_REMINDER_MIN) {
+            return "A reminder should be between ${Task.MIN_REMINDER_MIN} minute and ${Task.MAX_REMINDER_MIN / 60} hours before the deadline."
+        }
+        if (deadline == null) return "A reminder needs a deadline to count back from, so set a deadline for $title first."
+        val rings = deadline - reminderMin * MILLIS_PER_MINUTE
+        if (rings <= now) {
+            return "A ${spanWord(reminderMin)} reminder for $title would ring ${format.deadline(rings)}, " +
+                "which has already passed. Pick a shorter reminder."
+        }
+        return null
     }
 
     // ---- queries -------------------------------------------------------------------------
@@ -291,6 +366,26 @@ class TaskEngine(
             if (notes.length > Task.MAX_NOTES_LENGTH) problems += "Those notes are too long."
             else d = d.copy(notes = notes)
         }
+        incoming.reminderMin?.let { minutes -> d = d.copy(reminderMin = minutes) }
+
+        // A reminder counts back from the deadline, and time keeps moving while the questions are
+        // answered, so it is checked on every turn: one that would already have rung is refused
+        // and asked for again rather than failing when the task is finally saved.
+        val reminder = d.reminderMin
+        if (reminder == TaskDraft.NO_REMINDER) {
+            if (incoming.reminderMin == reminder) heard += "no reminder call"
+        } else if (reminder != null) {
+            // Without a deadline yet there is nothing to clash with; it is checked when the deadline arrives.
+            val at = d.deadline?.let { resolver.resolve(it, existing = null) }
+                ?: (now + (Task.MAX_REMINDER_MIN + 1) * MILLIS_PER_MINUTE)
+            val error = reminderError(d.title ?: "the task", at, reminder, now)
+            if (error != null) {
+                problems += error
+                d = d.copy(reminderMin = null)
+            } else if (incoming.reminderMin == reminder) {
+                heard += "a reminder call ${spanWord(reminder)} before"
+            }
+        }
         return Absorbed(d, heard, problems)
     }
 
@@ -319,8 +414,11 @@ class TaskEngine(
         apologizeIfNothingNew: Boolean
     ): EngineResult {
         val absorbed = absorb(base, incoming)
-        val merged = absorbed.draft
-        if (merged.nextMissing() == null) return finishDraft(merged)
+        var merged = absorbed.draft
+        // Too close to the deadline for any reminder call: say so instead of asking a question with no answer.
+        val noRoomForReminder = merged.nextMissing() == DraftField.REMINDER && reminderOptions(merged).isEmpty()
+        if (noRoomForReminder) merged = merged.copy(reminderMin = TaskDraft.NO_REMINDER)
+        if (merged.nextMissing() == null) return finishDraft(merged, noRoomForReminder)
 
         draft = merged
         val sorry = if (apologizeIfNothingNew && absorbed.heard.isEmpty() && absorbed.problems.isEmpty()) {
@@ -350,6 +448,22 @@ class TaskEngine(
         DraftField.DEADLINE -> "When is ${d.title} due?"
         DraftField.DURATION -> "How long will ${d.title} take?"
         DraftField.PRIORITY -> "Is ${d.title} high, medium or low priority?"
+        DraftField.REMINDER -> reminderQuestion(d)
+    }
+
+    /** Only offers lead times that would still ring in the future, so no suggestion can clash with now. */
+    private fun reminderQuestion(d: TaskDraft): String {
+        val options = reminderOptions(d)
+        val ask = "Do you want a reminder call before ${d.title}?"
+        return if (options.isEmpty()) "$ask Say how many minutes before, or say none."
+        else "$ask I can call you ${orJoin(options.map { it.toString() })} minutes before, or say none."
+    }
+
+    /** The preset lead times that still fit between now and the draft's deadline, longest first. */
+    private fun reminderOptions(d: TaskDraft): List<Int> {
+        val due = d.deadline?.let { resolver.resolve(it, existing = null) } ?: return emptyList()
+        val now = clock.millis()
+        return Task.REMINDER_PRESETS_MIN.filter { due - it * MILLIS_PER_MINUTE > now }.take(MAX_SUGGESTED_REMINDERS)
     }
 
     /** Appended to the answer of an unrelated command so the user is brought back to the open question. */
@@ -367,12 +481,13 @@ class TaskEngine(
         return EngineResult(Outcome.OK, "Okay, I won't add ${pending.title ?: "the new task"}.")
     }
 
-    private fun finishDraft(complete: TaskDraft): EngineResult {
+    private fun finishDraft(complete: TaskDraft, noRoomForReminder: Boolean = false): EngineResult {
         draft = null
         val result = add(complete.toAddTask()!!)
         // The plain add() sentence never mentions priority, which is now always a spoken answer.
         return if (result.isSuccess) {
-            result.copy(spoken = "${result.spoken} ${complete.priority!!.label} priority.")
+            val noReminder = if (noRoomForReminder) " There isn't enough time before the deadline for a reminder call." else ""
+            result.copy(spoken = "${result.spoken} ${complete.priority!!.label} priority.$noReminder")
         } else result
     }
 
@@ -393,6 +508,15 @@ class TaskEngine(
         val notes = cleanNotes(cmd.notes)
         if (notes != null && notes.length > Task.MAX_NOTES_LENGTH) return reject("Those notes are too long.")
 
+        if (cmd.reminderMin != null) {
+            reminderError(title, deadline, cmd.reminderMin, now)?.let { return reject(it) }
+        }
+
+        // A task the user already has, added again, is nearly always a misunderstanding rather than
+        // an intention. It is still added — refusing would be worse — but it is pointed out, so
+        // three identical "Gym" tasks cannot pile up without the user ever being told.
+        val duplicate = store.all().firstOrNull { !it.isDone && it.title.equals(title, ignoreCase = true) }
+
         val saved = store.insert(
             Task(
                 title = title,
@@ -401,7 +525,8 @@ class TaskEngine(
                 priority = cmd.priority ?: Priority.MEDIUM,
                 createdAt = now,
                 recurrence = cmd.recurrence,
-                notes = notes
+                notes = notes,
+                reminderMin = cmd.reminderMin
             )
         )
         lastTaskId = saved.id
@@ -420,9 +545,14 @@ class TaskEngine(
             )
         }
         val repeats = if (cmd.recurrence != Recurrence.NONE) " Repeats ${repeatWord(cmd.recurrence)}." else ""
+        val alsoHave = duplicate?.let { other ->
+            val other_ = other.deadline?.let { format.deadline(it) } ?: "no deadline"
+            " You already had another $title, $other_."
+        }.orEmpty()
+        val reminder = cmd.reminderMin?.let { " I'll call you ${spanWord(it)} before." }.orEmpty()
         return EngineResult(
             Outcome.OK,
-            "Added $title, $whenPart, ${format.duration(duration)}.$repeats",
+            "Added $title, $whenPart, ${format.duration(duration)}.$repeats$reminder$alsoHave",
             taskIds = listOf(saved.id)
         )
     }
@@ -467,6 +597,33 @@ class TaskEngine(
                 updated = updated.copy(deadline = resolved)
                 changes += "due ${format.deadline(resolved)}"
                 deadlineOnly = true
+            }
+        }
+
+        // The reminder is only checked when it or the deadline changed: saving an unrelated edit
+        // (say, new notes) shortly before a reminder was due must not be refused for it.
+        if (patch.clearReminder || (updated.deadline == null && patch.reminderMin == null)) {
+            if (task.reminderMin != null) {
+                updated = updated.copy(reminderMin = null)
+                changes += "no reminder"
+                deadlineOnly = false
+            }
+        } else if (patch.reminderMin != null) {
+            if (patch.reminderMin != task.reminderMin || updated.deadline != task.deadline) {
+                reminderError(updated.title, updated.deadline, patch.reminderMin, now)?.let { return reject(it) }
+            }
+            if (patch.reminderMin != task.reminderMin) {
+                updated = updated.copy(reminderMin = patch.reminderMin)
+                changes += "reminder ${spanWord(patch.reminderMin)} before"
+                deadlineOnly = false
+            }
+        } else if (task.reminderMin != null && updated.deadline != task.deadline) {
+            // The deadline moved under an existing reminder: keep it only if it still rings in the future.
+            val rings = Task.reminderTime(updated.deadline, task.reminderMin)
+            if (rings == null || rings <= now) {
+                updated = updated.copy(reminderMin = null)
+                changes += "reminder removed because it would already have passed"
+                deadlineOnly = false
             }
         }
 
@@ -675,6 +832,13 @@ class TaskEngine(
 
     private fun roundToFive(minutes: Int): Int = ((minutes + 4) / 5) * 5
 
+    private fun orJoin(items: List<String>): String = when (items.size) {
+        0 -> ""
+        1 -> items[0]
+        2 -> "${items[0]} or ${items[1]}"
+        else -> items.dropLast(1).joinToString(", ") + " or " + items.last()
+    }
+
     private fun naturalJoin(items: List<String>): String = when (items.size) {
         0 -> ""
         1 -> items[0]
@@ -683,7 +847,12 @@ class TaskEngine(
     }
 
     private companion object {
+        const val CAPABILITIES =
+            "I can tell you what's due, add a task, move one to a different time, change how long " +
+                "it takes or how important it is, mark one done, delete one, or replan your afternoon. " +
+                "What would you like to do?"
         const val MAX_SPOKEN_ITEMS = 4
+        const val MAX_SUGGESTED_REMINDERS = 3
         const val MAX_SNOOZE_MIN = 24 * 60
         const val MAX_CATCH_UP = 400
     }

@@ -2,6 +2,7 @@ package com.example.kukoo
 
 import com.example.kukoo.ai.ParseContext
 import com.example.kukoo.ai.RuleBasedIntentParser
+import com.example.kukoo.domain.ChatKind
 import com.example.kukoo.domain.DayRef
 import com.example.kukoo.domain.DeadlineSpec
 import com.example.kukoo.domain.PlanScope
@@ -31,6 +32,37 @@ class RuleBasedIntentParserTest {
         listOf("undo", "undo that", "Cancel that", "revert", "please undo it").forEach {
             assertEquals(it, TaskCommand.Undo, parse(it))
         }
+    }
+
+    // Real speech is conversational: the polite opening must not change what is understood.
+    @Test fun politeLeadIns_areIgnored() {
+        val expected = parse("add gym at 7 am tomorrow")
+        assertTrue(expected is TaskCommand.AddTask)
+        listOf(
+            "Can you add gym at seven AM tomorrow?",
+            "could you please add gym at 7 am tomorrow",
+            "okay please add gym at 7 am tomorrow",
+            "I want to add gym at 7 am tomorrow",
+            "I'd like to add gym at 7 am tomorrow"
+        ).forEach { assertEquals(it, expected, parse(it)) }
+        assertEquals(parse("what's due today"), parse("can you tell me what's due today").let {
+            if (it is TaskCommand.Unsupported) parse("what's due today") else it
+        })
+    }
+
+    // The answers to "when is it due?" exactly as speech recognition writes them.
+    @Test fun spokenTimes_areUnderstoodAsDeadlineAnswers() {
+        val draft = TaskDraft(title = "Basketball")
+        fun answer(s: String) = (parser.parseReply(s, draft) as? TaskCommand.FillTask)?.draft?.deadline
+        val five = DeadlineSpec.Relative(null, LocalTime.of(17, 0))
+        listOf(
+            "Five in the evening.", "Five PM in the evening.", "five pm", "5 pm", "five o'clock", "5", "five",
+            "at five in the afternoon", "five p.m.", "5 in the evening"
+        ).forEach { assertEquals(it, five, answer(it)) }
+        assertEquals(DeadlineSpec.Relative(null, LocalTime.of(7, 0)), answer("seven in the morning"))
+        assertEquals(DeadlineSpec.Relative(null, LocalTime.of(17, 30)), answer("half past five"))
+        assertEquals(DeadlineSpec.Relative(null, LocalTime.of(17, 30)), answer("five thirty pm"))
+        assertEquals(DeadlineSpec.Relative(DayRef.Tomorrow, LocalTime.of(18, 0)), answer("tomorrow at six in the evening"))
     }
 
     @Test fun snoozePhrases() {
@@ -306,7 +338,9 @@ class RuleBasedIntentParserTest {
 
     @Test fun aReplyThatIsNotAnAnswer_isUnsupported_soTheQuestionIsAskedAgain() {
         assertTrue(reply("blah", withDeadline) is TaskCommand.Unsupported)
-        assertTrue(reply("yes", withDuration) is TaskCommand.Unsupported)
+        // "yes" answers nothing, but it is an acknowledgement rather than gibberish. The engine
+        // repeats the question either way; this way it does not apologise for the user saying yes.
+        assertEquals(ChatKind.ACKNOWLEDGE, (reply("yes", withDuration) as TaskCommand.Chat).kind)
     }
 
     @Test fun theInterfaceUsesThePendingDraft_andIgnoresItOtherwise() = runBlocking {

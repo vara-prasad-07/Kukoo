@@ -145,6 +145,12 @@ object TitleMatcher {
 
     private const val MIN_SCORE = 45
 
+    /** How alike two words must sound to count as the same name said differently. */
+    private const val FUZZY_WORD_SCORE = 80
+
+    /** Ceiling for a sounds-like match, so any real word overlap outranks it. */
+    private const val FUZZY_BASE = 62
+
     fun resolve(query: String, pool: List<Task>): Match {
         val q = tokens(query)
         if (q.isEmpty() || pool.isEmpty()) return Match.None
@@ -168,9 +174,19 @@ object TitleMatcher {
         val tc = title.joinToString("")
         if (qc.length >= 4 && (tc.contains(qc) || (tc.length >= 4 && qc.contains(tc)))) return 70
 
+        // Exact word overlap, then how close the words sound. Speech recognition mishears names
+        // constantly ("gim" for "gym", "dec" for "deck"): without the sounds-like score a misheard
+        // name silently becomes a brand-new task instead of the one the user meant. The better of
+        // the two wins, because one exact word out of two ("expence report") scores poorly on its
+        // own yet is obviously the right task once the other word is heard properly.
         val overlap = query.count { it in title }
-        val ratio = overlap.toDouble() / query.size
-        return if (overlap > 0 && ratio >= 0.5) (40 * ratio + 10).toInt() else 0
+        val exact = if (overlap > 0) (40.0 * overlap / query.size + 10).toInt() else 0
+
+        val alike = query.count { q -> title.any { FuzzyText.similar(q, it, FUZZY_WORD_SCORE) } }
+        // Deliberately capped below every exact-match score above, so a real match always wins.
+        val fuzzy = if (alike > 0) (FUZZY_BASE.toDouble() * alike / query.size).toInt() else 0
+
+        return maxOf(exact, fuzzy)
     }
 
     private fun tokens(text: String): List<String> =

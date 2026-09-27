@@ -14,6 +14,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
 import com.example.kukoo.call.BatteryOptimization
+import com.example.kukoo.call.CallAlarmReceiver
 import com.example.kukoo.call.CallForegroundService
 import com.example.kukoo.call.IncomingCallNotifier
 import com.example.kukoo.ui.KukooRoot
@@ -86,6 +87,7 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         (application as KukooApp).container.appVisible = true
+        viewModel.onAppForegrounded()
         maybeAskBatteryWhitelist()
     }
 
@@ -121,7 +123,10 @@ class MainActivity : ComponentActivity() {
         if (intent?.action != IncomingCallNotifier.ACTION_INCOMING_CALL) return
         IncomingCallNotifier.cancel(this)
         if (sessionService) CallForegroundService.startSession(this) // cancel() also stops the service
-        viewModel.onIncomingCall(fromAlarm = true)
+        viewModel.onIncomingCall(
+            fromAlarm = true,
+            taskId = intent.getLongExtra(CallAlarmReceiver.EXTRA_TASK_ID, CallAlarmReceiver.NO_TASK)
+        )
         // Consume it so a later recreate does not ring again.
         intent.action = null
     }

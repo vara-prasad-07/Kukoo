@@ -5,15 +5,19 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import com.example.kukoo.domain.Goal
+import com.example.kukoo.domain.GoalKind
+import com.example.kukoo.domain.HistoryEntry
 import com.example.kukoo.domain.OverlapAck
 import com.example.kukoo.domain.Priority
+import com.example.kukoo.domain.ProfileStore
 import com.example.kukoo.domain.Recurrence
 import com.example.kukoo.domain.Task
 import com.example.kukoo.domain.TaskStatus
 import com.example.kukoo.domain.TaskStore
 
 /** Local SQLite persistence for tasks: title, deadline, duration, priority, status, recurrence, notes. */
-class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_VERSION), TaskStore {
+class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_VERSION), TaskStore, ProfileStore {
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
@@ -35,6 +39,21 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
         )
         db.execSQL("CREATE INDEX idx_tasks_deadline ON $TABLE($DEADLINE)")
         createAckTable(db)
+        createProfileTables(db)
+    }
+
+    /** What the assistant learns from: the user's goals, and what they did (or skipped) before. */
+    private fun createProfileTables(db: SQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS $GOALS (g_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL, " +
+                "keywords TEXT NOT NULL, weight INTEGER NOT NULL, daily_target_min INTEGER NOT NULL, " +
+                "starter_title TEXT, starter_min INTEGER NOT NULL)"
+        )
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS $HISTORY (h_id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, " +
+                "started_at INTEGER NOT NULL, duration_min INTEGER NOT NULL, priority TEXT NOT NULL, completed INTEGER NOT NULL)"
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_history_started ON $HISTORY(started_at)")
     }
 
     private fun createAckTable(db: SQLiteDatabase) {
@@ -55,6 +74,81 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
             db.execSQL("ALTER TABLE $TABLE ADD COLUMN $REMINDER INTEGER")
         }
         if (oldVersion < 4) createAckTable(db)
+        if (oldVersion < 5) createProfileTables(db)
+    }
+
+    override fun goals(): List<Goal> {
+        val out = mutableListOf<Goal>()
+        readableDatabase.query(GOALS, null, null, null, null, null, "g_id ASC").use { c ->
+            while (c.moveToNext()) {
+                out += Goal(
+                    id = c.getLong(c.getColumnIndexOrThrow("g_id")),
+                    name = c.getString(c.getColumnIndexOrThrow("name")),
+                    kind = runCatching { GoalKind.valueOf(c.getString(c.getColumnIndexOrThrow("kind"))) }.getOrDefault(GoalKind.GOAL),
+                    keywords = c.getString(c.getColumnIndexOrThrow("keywords")).split(',').map { it.trim() }.filter { it.isNotEmpty() },
+                    weight = c.getInt(c.getColumnIndexOrThrow("weight")),
+                    dailyTargetMin = c.getInt(c.getColumnIndexOrThrow("daily_target_min")),
+                    starterTitle = c.getColumnIndexOrThrow("starter_title").let { if (c.isNull(it)) null else c.getString(it) },
+                    starterMin = c.getInt(c.getColumnIndexOrThrow("starter_min"))
+                )
+            }
+        }
+        return out
+    }
+
+    override fun replaceGoals(goals: List<Goal>) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.delete(GOALS, null, null)
+            goals.forEach { g ->
+                db.insertOrThrow(GOALS, null, ContentValues().apply {
+                    put("name", g.name); put("kind", g.kind.name); put("keywords", g.keywords.joinToString(","))
+                    put("weight", g.weight); put("daily_target_min", g.dailyTargetMin)
+                    put("starter_title", g.starterTitle); put("starter_min", g.starterMin)
+                })
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    override fun history(): List<HistoryEntry> {
+        val out = mutableListOf<HistoryEntry>()
+        readableDatabase.query(HISTORY, null, null, null, null, null, "started_at ASC").use { c ->
+            while (c.moveToNext()) {
+                out += HistoryEntry(
+                    id = c.getLong(c.getColumnIndexOrThrow("h_id")),
+                    title = c.getString(c.getColumnIndexOrThrow("title")),
+                    startedAt = c.getLong(c.getColumnIndexOrThrow("started_at")),
+                    durationMin = c.getInt(c.getColumnIndexOrThrow("duration_min")),
+                    priority = Priority.fromName(c.getString(c.getColumnIndexOrThrow("priority"))),
+                    completed = c.getInt(c.getColumnIndexOrThrow("completed")) != 0
+                )
+            }
+        }
+        return out
+    }
+
+    override fun addHistory(entries: List<HistoryEntry>) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            entries.forEach { e ->
+                db.insertOrThrow(HISTORY, null, ContentValues().apply {
+                    put("title", e.title); put("started_at", e.startedAt); put("duration_min", e.durationMin)
+                    put("priority", e.priority.name); put("completed", if (e.completed) 1 else 0)
+                })
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    override fun clearHistory() {
+        writableDatabase.delete(HISTORY, null, null)
     }
 
     override fun all(): List<Task> {
@@ -147,9 +241,11 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
 
     private companion object {
         const val DB_NAME = "kukoo.db"
-        const val DB_VERSION = 4
+        const val DB_VERSION = 5
         const val TABLE = "tasks"
         const val ACKS = "overlap_acks"
+        const val GOALS = "goals"
+        const val HISTORY = "task_history"
         const val ID = "id"
         const val TITLE = "title"
         const val DEADLINE = "deadline_at"

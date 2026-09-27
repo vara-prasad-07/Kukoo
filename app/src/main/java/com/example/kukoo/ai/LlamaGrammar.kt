@@ -15,7 +15,7 @@ object LlamaGrammar {
 root ::= "{" ws "\"action\"" ws ":" ws body ws "}"
 
 body ::= addbody | answerbody | querybody | updatebody | targetbody | replanbody | snoozebody
-       | chatbody | findbody | planbody | plantasksbody | planchangebody | simplebody
+       | chatbody | findbody | planbody | plantasksbody | planchangebody | suggestbody | simplebody
 
 # A new task: whatever details the user gave, and never a target (it does not exist yet).
 addbody    ::= "\"add_task\"" (ws "," ws detail)*
@@ -37,6 +37,9 @@ querybody  ::= "\"query_tasks\"" (ws "," ws "\"scope\"" ws ":" ws ("\"today\"" |
 replanbody ::= "\"replan\"" (ws "," ws "\"scope\"" ws ":" ws ("\"afternoon\"" | "\"day\""))?
 snoozebody ::= "\"snooze\"" (ws "," ws duration)?
 findbody   ::= "\"find_time\"" (ws "," ws duration)?
+
+# The assistant picks the task: only a length and a day can come from the user, never a title.
+suggestbody ::= "\"suggest_task\"" (ws "," ws duration)? (ws "," ws day)?
 chatbody   ::= "\"chat\"" ws "," ws chatkind
 simplebody ::= "\"discard_task\"" | "\"undo\"" | "\"end_call\"" | "\"check_conflicts\"" | "\"unsupported\"" | "\"approve_plan\""
 

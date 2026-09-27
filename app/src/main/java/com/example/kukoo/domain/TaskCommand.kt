@@ -179,6 +179,13 @@ sealed interface TaskCommand {
     /** "Yes, add it": the proposed plan becomes real tasks. */
     data object PlanApprove : TaskCommand
 
+    /**
+     * "Add one extra task for an hour based on my goals": the assistant picks the task, from the user's habits,
+     * goals and interests. [durationMin] and [day] are only what the user said. Heard while a suggestion is open,
+     * it means "something else" (or, with a length, "make it that long").
+     */
+    data class SuggestTask(val durationMin: Int? = null, val day: DayRef? = null) : TaskCommand
+
     /** Reverts the most recent change made by add / update / complete / reopen / delete. */
     data object Undo : TaskCommand
 
@@ -232,7 +239,9 @@ enum class QuestionKind {
     /** The start time is in the middle of the night, so probably a misheard AM/PM. */
     ODD_HOUR,
     /** A task has no start time and the assistant suggested one. */
-    SCHEDULE
+    SCHEDULE,
+    /** The assistant picked a task from the user's habits and goals and asked whether to add it. */
+    SUGGESTION
 }
 
 /**

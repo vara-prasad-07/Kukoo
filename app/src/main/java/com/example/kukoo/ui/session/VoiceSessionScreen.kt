@@ -88,6 +88,7 @@ private val SUGGESTIONS = listOf(
     "What's on today?",
     "Add a task",
     "Plan my day",
+    "Add one extra task for 1 hour based on my goals",
     "Move the client deck to tomorrow",
     "Mark the follow-up as done",
     "Delete the expense task",

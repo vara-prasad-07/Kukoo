@@ -136,6 +136,34 @@ internal object Grounding {
     /** "Plan my day" needs the user to have said something about planning. */
     fun planGrounded(utterance: String): Boolean = planWord.containsMatchIn(utterance.lowercase(Locale.ROOT))
 
+    private val suggestWord = Regex(
+        "\\b(?:suggest\\w*|recommend\\w*|advise|surprise me)\\b|" +
+            "\\bbased on (?:my|the|what)\\b|\\baccording to my\\b|\\bwhat (?:should|can|could) i (?:do|work on|add|try)\\b|" +
+            "\\b(?:my|for my|towards my) (?:goals?|interests?|habits?|routine|history|hobbies|hobby)\\b|" +
+            "\\b(?:extra|one more|additional) (?:task|thing|activity)\\b|\\bwhat do i usually\\b|\\bfill (?:my|the|this) (?:free|empty|gap)"
+    )
+
+    /**
+     * The user asked the assistant to pick a task ("add one extra task for an hour based on my goals"). Without
+     * one of these phrases a nameless "add a task" stays what it is, a question about the task's name.
+     */
+    fun suggestGrounded(utterance: String): Boolean = suggestWord.containsMatchIn(utterance.lowercase(Locale.ROOT))
+
+    private val suggestFiller = setOf(
+        "extra", "additional", "another", "more", "activity", "for", "hr", "hrs", "hour", "hours", "minute", "minutes",
+        "min", "mins", "today", "tomorrow", "based", "on", "my", "goal", "goals", "interest", "interests", "habit",
+        "habits", "routine", "history", "of"
+    )
+
+    /**
+     * A "title" that only restates the request ("extra task for 1 hr based on my goals"): a model that is told to
+     * add a task will happily copy those words into the title, and the words are all in the user's sentence.
+     */
+    fun isSuggestRequestTitle(text: String): Boolean {
+        val numbers = numberWords.split('|').toSet()
+        return tokens(text).all { it in notATitle || it in suggestFiller || it in numbers || it.all(Char::isDigit) }
+    }
+
     private val planFiller = setOf(
         "plan", "planning", "my", "day", "days", "today", "tomorrow", "tmr", "tmrw", "schedule", "agenda", "for", "and", "i", "have"
     )

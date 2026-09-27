@@ -2,6 +2,7 @@ package com.example.kukoo.ai
 
 import com.example.kukoo.domain.ConflictChoice
 import com.example.kukoo.domain.ConflictQuestion
+import com.example.kukoo.domain.QuestionKind
 import com.example.kukoo.domain.TaskCommand
 import java.util.Locale
 
@@ -42,9 +43,38 @@ internal object ConflictReplies {
 
     private val neverMind = Regex("(?:never ?mind|forget it|forget about it|drop it|skip it|skip)")
 
+    /** After a suggestion, the ways of saying "yes, add that one". */
+    private val addIt = Regex("(?:yes )?(?:add|schedule|book|put|use) (?:it|that|this|that one)(?: in| please)?")
+
+    /** After a suggestion, the ways of asking for another one. */
+    private val somethingElse = Regex(
+        "(?:something else|something different|another(?: one| suggestion| option)?|what else|anything else|" +
+            "(?:any )?other (?:options?|suggestions?|ideas?)|next(?: one)?|different(?: one)?|show me more|give me another(?: one)?|" +
+            "try another(?: one)?|not (?:that|this)(?: one)?, something else)"
+    )
+
+    private val stopSuggesting = Regex("(?:never ?mind|forget it|forget about it|drop it|cancel(?: it| that)?|stop|leave it)")
+    private val skip = Regex("(?:skip|skip it|skip this|skip that|pass)")
+
+    private fun readSuggestion(t: String): TaskCommand? = when {
+        // "Never mind" ends it; "no" and "skip" move on to the next suggestion.
+        stopSuggesting.matches(t) -> TaskCommand.Resolve(ConflictChoice.KEEP)
+        skip.matches(t) -> TaskCommand.SuggestTask()
+        addIt.matches(t) || accept.matches(t) -> TaskCommand.Resolve(ConflictChoice.ACCEPT)
+        somethingElse.matches(t) -> TaskCommand.SuggestTask()
+        decline.matches(t) -> TaskCommand.Resolve(ConflictChoice.DECLINE)
+        else -> affirmative.find(t)?.let { t.removeRange(it.range).trim() }?.takeIf { it.isNotEmpty() }?.let { rest ->
+            when {
+                addIt.matches(rest) || accept.matches(rest) -> TaskCommand.Resolve(ConflictChoice.ACCEPT)
+                else -> null
+            }
+        }
+    }
+
     fun read(utterance: String, question: ConflictQuestion): TaskCommand? {
         val t = normalize(utterance).replace(Regex("\\s+(?:please|thanks|thank you)$"), "")
         if (t.isEmpty()) return null
+        if (question.kind == QuestionKind.SUGGESTION) return readSuggestion(t)
 
         if (question.forDraft) {
             // While a task is being set up, cancelling drops it.

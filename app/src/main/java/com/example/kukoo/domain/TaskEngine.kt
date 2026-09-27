@@ -16,9 +16,12 @@ class TaskEngine(
     private val store: TaskStore,
     private val replanner: Replanner,
     private val clock: Clock = Clock.systemDefaultZone(),
-    private val config: PlannerConfig = PlannerConfig()
+    private val config: PlannerConfig = PlannerConfig(),
+    /** What the assistant knows about the user (goals, past activity); [NoProfile] until there is something. */
+    private val profile: ProfileStore = NoProfile
 ) {
     private val mutex = Mutex()
+    private val recommender = Recommender(clock, config)
     private val resolver = DeadlineResolver(clock, config)
     private val detector = ConflictDetector(resolver)
     private val slotFinder = SlotFinder(config, resolver)
@@ -58,7 +61,11 @@ class TaskEngine(
             }
             return offer?.let {
                 ConflictQuestion(
-                    if (it.kind == OfferKind.SCHEDULE) QuestionKind.SCHEDULE else QuestionKind.OVERLAP,
+                    when (it.kind) {
+                        OfferKind.SCHEDULE -> QuestionKind.SCHEDULE
+                        OfferKind.SUGGEST -> QuestionKind.SUGGESTION
+                        OfferKind.FIX_OVERLAP -> QuestionKind.OVERLAP
+                    },
                     it.slot != null, forDraft = false, it.title
                 )
             }
@@ -86,6 +93,11 @@ class TaskEngine(
     }
 
     fun tasks(): List<Task> = store.all()
+
+    /** What the assistant has learnt from the past: the user's repeated activities, most regular first. */
+    fun habits(): List<Habit> = recommender.habits(store.all(), profile)
+
+    fun goals(): List<Goal> = profile.goals()
 
     /**
      * Runs one command exactly as given. Forms and the UI use this: an [TaskCommand.AddTask] here is
@@ -125,6 +137,7 @@ class TaskEngine(
         is TaskCommand.PlanAdd -> planAdd(command)
         is TaskCommand.PlanChange -> planChange(command)
         TaskCommand.PlanApprove -> approvePlan()
+        is TaskCommand.SuggestTask -> suggest(command, standing = null)
         TaskCommand.Undo -> undo()
         is TaskCommand.Snooze -> snooze(command.minutes)
         TaskCommand.EndCall -> EngineResult(Outcome.END_CALL, "Okay, goodbye. Your tasks are up to date.")
@@ -208,6 +221,13 @@ class TaskEngine(
             // chat() re-asks the pending question itself, so it must not also get a draft reminder.
             is TaskCommand.PlanDay, is TaskCommand.PlanAdd, is TaskCommand.PlanChange, TaskCommand.PlanApprove ->
                 dispatch(command)
+            // "Something else" / "make it 30 minutes" after a suggestion; a fresh request otherwise. Not while another
+            // dialog is open: that one is finished first.
+            is TaskCommand.SuggestTask -> when {
+                pending != null -> ask(pending, prefix = "Let's finish this task first. ")
+                planning != null -> EngineResult(Outcome.NEEDS_INFO, "Let's finish the plan first. ${planQuestion(planning)}")
+                else -> suggest(command, standing)
+            }
             is TaskCommand.Unsupported -> when {
                 pending != null -> ask(pending, prefix = "Sorry, I didn't catch that. ")
                 planning != null -> EngineResult(Outcome.NEEDS_INFO, "Sorry, I didn't catch that. ${planQuestion(planning)}")
@@ -1382,6 +1402,150 @@ class TaskEngine(
         return naturalJoin(if (more > 0) shown + "$more more" else shown)
     }
 
+    // ---- personalised suggestions --------------------------------------------------------
+
+    /**
+     * "Add one extra task for an hour based on my goals": the [Recommender] picks from what the user really does
+     * and wants, this reads the pick back with its reasons, and nothing is written until the user says yes. Heard
+     * while a suggestion is open it moves on to the next one, or resizes this one when a length was given.
+     */
+    private fun suggest(cmd: TaskCommand.SuggestTask, standing: Offer?): EngineResult {
+        val open = standing?.suggestion
+        if (open != null) {
+            val minutes = cmd.durationMin
+            return if (minutes != null && minutes != open.current.durationMin) resizeSuggestion(open, minutes)
+            else nextSuggestion(open, prefix = "")
+        }
+
+        cmd.durationMin?.let { minutes -> durationError(minutes)?.let { return reject(it) } }
+        if (profile.goals().isEmpty() && profile.history().isEmpty() && store.all().none { it.isDone }) {
+            return EngineResult(
+                Outcome.OK,
+                "I don't know your routine yet, so I'd only be guessing. Tell me what to add, or finish a few tasks " +
+                    "and I'll start suggesting."
+            )
+        }
+
+        val lead = StringBuilder()
+        var date = resolver.dateOf(cmd.day, null)
+        if (date == resolver.today() && tooLateToday()) {
+            date = date.plusDays(1)
+            lead.append("It's too late to fit anything more into today, so I looked at tomorrow. ")
+        }
+        val ranked = recommender.rank(store.all(), profile, date, cmd.durationMin)
+        val best = ranked.firstOrNull() ?: return EngineResult(
+            Outcome.OK,
+            lead.toString() + "I couldn't find room for ${cmd.durationMin?.let { format.duration(it) } ?: "anything from your routine"} " +
+                "${format.day(date)}. Try a shorter time, or another day."
+        )
+        return offerSuggestion(OpenSuggestion(date, cmd.durationMin, best, setOf(best.title.lowercase())), lead.toString())
+    }
+
+    private fun offerSuggestion(open: OpenSuggestion, prefix: String): EngineResult {
+        val s = open.current
+        offer = Offer(OfferKind.SUGGEST, 0, s.title, s.start, open)
+        val why = suggestionReasons(s, open.date)
+        val because = if (why.isEmpty()) "" else " ${naturalJoin(why).replaceFirstChar { it.uppercase() }}."
+        return EngineResult(
+            Outcome.NEEDS_INFO,
+            "${prefix}Based on your routine, I'd add ${s.title} ${format.day(s.start)}, ${rangeWord(TimeRange(s.start, s.end))}, " +
+                "${format.duration(s.durationMin)}, ${s.priority.label.lowercase()} priority.$because " +
+                "Should I add it, or would you like something else?"
+        )
+    }
+
+    private fun nextSuggestion(open: OpenSuggestion, prefix: String): EngineResult {
+        val next = recommender.rank(store.all(), profile, open.date, open.wantedMin, exclude = open.shown).firstOrNull()
+            ?: return EngineResult(
+                Outcome.OK,
+                "${prefix}That's everything I'd suggest from your routine ${format.day(open.date)}. " +
+                    "Tell me what to add instead, or ask again later."
+            )
+        return offerSuggestion(open.copy(current = next, shown = open.shown + next.title.lowercase()), prefix)
+    }
+
+    /** "Make it 30 minutes": the same activity, another length, at the nearest time it fits. */
+    private fun resizeSuggestion(open: OpenSuggestion, minutes: Int): EngineResult {
+        durationError(minutes)?.let {
+            offer = Offer(OfferKind.SUGGEST, 0, open.current.title, open.current.start, open)
+            return reject(it)
+        }
+        val s = open.current
+        val start = recommender.place(store.all(), open.date, minutes, s.near)
+        if (start == null) {
+            offer = Offer(OfferKind.SUGGEST, 0, s.title, s.start, open)
+            return EngineResult(
+                Outcome.NEEDS_INFO,
+                "I can't fit ${format.duration(minutes)} of ${s.title} ${format.day(open.date)}. " +
+                    "Shall I add it for ${format.duration(s.durationMin)} as planned, or would you like something else?"
+            )
+        }
+        val resized = s.copy(durationMin = minutes, start = start)
+        offer = Offer(OfferKind.SUGGEST, 0, s.title, start, open.copy(current = resized, wantedMin = minutes))
+        return EngineResult(
+            Outcome.NEEDS_INFO,
+            "Okay, ${s.title} for ${format.duration(minutes)}, ${format.day(start)}, ${rangeWord(TimeRange(start, resized.end))}. " +
+                "Should I add it?"
+        )
+    }
+
+    private fun acceptSuggestion(open: OpenSuggestion): EngineResult {
+        val s = open.current
+        val now = clock.millis()
+        // Time keeps moving while the user thinks, so the slot is checked again instead of trusted.
+        val start = recommender.place(store.all(), open.date, s.durationMin, s.near)
+        if (start == null) {
+            offer = Offer(OfferKind.SUGGEST, 0, s.title, null, open)
+            return EngineResult(
+                Outcome.NEEDS_INFO,
+                "There's no longer room for ${s.title} ${format.day(open.date)}. Say something else and I'll look again."
+            )
+        }
+        val saved = store.insert(
+            Task(
+                title = s.title,
+                deadline = start,
+                durationMin = s.durationMin,
+                priority = s.priority,
+                createdAt = now,
+                reminderMin = dayPlanner.reminderFor(start, start, now)
+            )
+        )
+        lastTaskId = saved.id
+        undoAction = { store.delete(saved.id); if (lastTaskId == saved.id) lastTaskId = null }
+        val moved = if (start != s.start) " The time I first offered was taken, so it's at ${format.clockTime(start)}." else ""
+        val call = saved.reminderMin?.let { " I'll call you ${spanWord(it)} before." }.orEmpty()
+        return EngineResult(
+            Outcome.OK,
+            "Done. I added ${s.title} for ${format.day(start)}, ${rangeWord(TimeRange(start, start + s.durationMin * MILLIS_PER_MINUTE))}, " +
+                "${format.duration(s.durationMin)}, ${s.priority.label.lowercase()} priority.$call$moved Say undo if you want it gone.",
+            taskIds = listOf(saved.id),
+            changedTasks = true
+        )
+    }
+
+    /** Why this one, in the order that persuades best: how often, which goal, when, how long a streak, not yet today. */
+    private fun suggestionReasons(s: Suggestion, date: LocalDate): List<String> {
+        val e = s.evidence
+        val out = mutableListOf<String>()
+        if (e.fromGoalOnly) {
+            out += when {
+                e.daysSince != null -> "you haven't worked on ${e.goalName} in ${e.daysSince} days"
+                else -> "nothing in your history serves ${e.goalName} yet"
+            }
+        } else {
+            if (e.doneDays7 >= 2) out += "you did it on ${e.doneDays7} of the last 7 days"
+            e.goalName?.let { out += if (e.goalKind == GoalKind.INTEREST) "it fits your $it interest" else "it supports your $it goal" }
+            e.usualStart?.let { out += "you usually do it around ${format.clockTime(it)}" }
+            if (e.streak >= 3) out += "you're on a ${e.streak}-day streak"
+        }
+        if (e.goalName != null && e.goalMinutesToday > 0 && e.goalMinutesToday < 24 * 60) {
+            out += "you've done ${format.duration(e.goalMinutesToday)} towards it ${if (date == resolver.today()) "today" else "that day"} so far"
+        }
+        if (date == resolver.today() && !e.fromGoalOnly) out += "you haven't done it yet today"
+        return out.take(MAX_REASONS)
+    }
+
     // ---- replanning ----------------------------------------------------------------------
 
     private suspend fun replan(scope: PlanScope): EngineResult {
@@ -1448,10 +1612,25 @@ class TaskEngine(
 
     // ---- conflicts -----------------------------------------------------------------------
 
-    private enum class OfferKind { FIX_OVERLAP, SCHEDULE }
+    private enum class OfferKind { FIX_OVERLAP, SCHEDULE, SUGGEST }
 
     /** [slot] is the time the assistant suggested, or null when there was no free time to suggest. */
-    private data class Offer(val kind: OfferKind, val taskId: Long, val title: String, val slot: Long?)
+    private data class Offer(
+        val kind: OfferKind,
+        val taskId: Long,
+        val title: String,
+        val slot: Long?,
+        val suggestion: OpenSuggestion? = null
+    )
+
+    /** A suggestion waiting for a yes: the one on offer, the others still to try, and what the user asked for. */
+    private data class OpenSuggestion(
+        val date: LocalDate,
+        val wantedMin: Int?,
+        val current: Suggestion,
+        /** Lower-cased titles already offered, so "something else" never repeats one. */
+        val shown: Set<String>
+    )
 
     /** A problem with the task being set up that has to be settled before it is saved. */
     private sealed interface DraftIssue {
@@ -1602,6 +1781,13 @@ class TaskEngine(
     )
 
     private fun resolveOffer(o: Offer, choice: ConflictChoice): EngineResult {
+        o.suggestion?.let { open ->
+            return when (choice) {
+                ConflictChoice.ACCEPT -> acceptSuggestion(open)
+                ConflictChoice.DECLINE -> nextSuggestion(open, prefix = "Okay. ")
+                ConflictChoice.KEEP -> EngineResult(Outcome.OK, "Okay, I won't add anything.")
+            }
+        }
         if (choice == ConflictChoice.ACCEPT) {
             val slot = o.slot
             if (slot == null) {
@@ -1818,7 +2004,7 @@ class TaskEngine(
 
     private companion object {
         const val CAPABILITIES =
-            "I can tell you what's on today, add a task, plan your day, move one to a different time, change how long " +
+            "I can tell you what's on today, add a task, suggest one from your goals and habits, plan your day, move one to a different time, change how long " +
                 "it takes or how important it is, mark one done, delete one, or replan your afternoon. " +
                 "What would you like to do?"
         const val MAX_SPOKEN_ITEMS = 4
@@ -1826,6 +2012,7 @@ class TaskEngine(
         const val MAX_SUGGESTED_REMINDERS = 3
         const val MAX_SNOOZE_MIN = 24 * 60
         const val MAX_PLAN_ITEMS = 12
+        const val MAX_REASONS = 3
 
         /** A day with less than this left is not planned; the plan moves to tomorrow. */
         const val MIN_PLAN_ROOM_MIN = 30

@@ -60,7 +60,8 @@ class AppContainer(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     val store = SqliteTaskStore(appContext)
-    val engine = TaskEngine(store, LocalReplanner(), clock)
+    // The same database also holds what the assistant knows about the user (goals, past activity).
+    val engine = TaskEngine(store, LocalReplanner(), clock, profile = store)
 
     /** Download state for the speech models; the LLM bundle is managed by GenieX itself. */
     val models = ModelRepository(appContext)
@@ -135,11 +136,11 @@ class AppContainer(
     /** Demo tasks on the very first launch only (never re-added after the user deletes them). */
     fun seedOnFirstRun() {
         if (prefs.getBoolean(KEY_SEEDED, false)) return
-        DemoData.reset(store, clock)
+        DemoData.reset(store, clock, profile = store)
         prefs.edit { putBoolean(KEY_SEEDED, true) }
     }
 
-    fun resetDemoData() = DemoData.reset(store, clock)
+    fun resetDemoData() = DemoData.reset(store, clock, profile = store)
 
     private companion object {
         const val TAG = "AppContainer"

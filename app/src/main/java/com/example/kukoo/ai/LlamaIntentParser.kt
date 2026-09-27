@@ -212,6 +212,11 @@ class LlamaIntentParser(
      * a new time, or a new length.
      */
     private fun conflictSection(q: ConflictQuestion): String = when {
+        q.kind == QuestionKind.SUGGESTION -> listOf(
+            "The assistant just suggested the task \"${q.taskTitle}\" and asked whether to add it or give something else.",
+            "- If they want a different suggestion, output {\"action\":\"suggest_task\"}.",
+            "- If they name a different length for it, output {\"action\":\"suggest_task\",\"duration_min\":N}.",
+        ).joinToString("\n")
         q.forDraft && q.kind == QuestionKind.ODD_HOUR -> listOf(
             "The assistant just asked whether the new task's start time, which is in the middle of the night, is really what they meant.",
             "- If they give a corrected time, output {\"action\":\"answer\"} with \"time\" (and \"day\" if they said one), e.g. \"three pm\" -> {\"action\":\"answer\",\"time\":\"15:00\"}.",
@@ -272,7 +277,15 @@ class LlamaIntentParser(
             ?: json.text("kind")?.let { "chat" }
 
         return when (action) {
-            "add_task" -> newTask(json, utterance, pending, expecting)
+            // "add one extra task for an hour based on my goals" names no task, and is a request to suggest one.
+            "add_task" -> newTask(json, utterance, pending, expecting).let { cmd ->
+                val unnamed = cmd is TaskCommand.StartTask || (cmd is TaskCommand.AddTask && Grounding.isSuggestRequestTitle(cmd.title))
+                if (unnamed && pending == null && planning == null && Grounding.suggestGrounded(utterance)) {
+                    TaskCommand.SuggestTask(duration(json, utterance), dayOf(json, utterance))
+                } else cmd
+            }
+            "suggest_task" ->
+                if (Grounding.suggestGrounded(utterance)) TaskCommand.SuggestTask(duration(json, utterance), dayOf(json, utterance)) else null
             // An answer only means something while a question is open.
             // With no task question open, an "answer" to the plan proposal is the yes it was waiting for.
             "answer" -> pending?.let { TaskCommand.FillTask(details(json, utterance, expecting)) }
@@ -562,7 +575,7 @@ class LlamaIntentParser(
             You turn one spoken sentence about a to-do list into ONE JSON object. Output the JSON only.
 
             Keys. Leave out every key the user did not clearly say. Never guess, invent or fill in a default.
-            "action": add_task, answer, discard_task, query_tasks, update_task, complete_task, reopen_task, delete_task, replan, plan_day, plan_tasks, plan_change, approve_plan, undo, snooze, end_call, ask_what_to_change, check_conflicts, find_time, chat, unsupported
+            "action": add_task, answer, discard_task, query_tasks, update_task, complete_task, reopen_task, delete_task, replan, plan_day, plan_tasks, plan_change, approve_plan, suggest_task, undo, snooze, end_call, ask_what_to_change, check_conflicts, find_time, chat, unsupported
             "title": the task's name, in the user's own words
             "day": today, tomorrow, or monday..sunday
             "date": "YYYY-MM-DD", only when the user names a calendar date such as the fifth of a month
@@ -594,6 +607,7 @@ class LlamaIntentParser(
             - find_time: they ask when they are free ("when am I free?", "when can I fit an hour?"). Include "duration_min" only if they named a length.
             - chat: a greeting, a thank-you, a bare acknowledgement ("okay", "yeah"), or asking what you can do. It looks like {"action":"chat","kind":"thanks"} — always include "action".
             - plan_day: the user wants help planning a day ("plan my day", "help me plan tomorrow", "plan my day for friday"). Name the day with "day" or "date". Add "tasks" only if they listed tasks in the same sentence. Never use replan for this: replan only reschedules tasks that are already on the list.
+            - suggest_task: the user wants the assistant to CHOOSE a task for them, from their goals, interests or habits ("add one extra task for an hour based on my goals", "suggest something for today", "what should I do next"). Include "duration_min" only if they named a length and "day" only if they named a day. Never write a task title for it.
             - Use unsupported only when nothing else fits.
         """.trimIndent()
     }

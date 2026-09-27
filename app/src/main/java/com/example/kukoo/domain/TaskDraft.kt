@@ -20,7 +20,11 @@ data class TaskDraft(
     val priority: Priority? = null,
     val recurrence: Recurrence = Recurrence.NONE,
     val notes: String? = null,
-    val reminderMin: Int? = null
+    val reminderMin: Int? = null,
+    /** The user heard that this overlaps another task and chose to keep both. */
+    val keepOverlaps: Boolean = false,
+    /** The user confirmed an unusual start hour (say 3 AM) is really what they meant. */
+    val hourConfirmed: Boolean = false
 ) {
     /** The next required detail to ask for, or null when the task is complete. */
     fun nextMissing(): DraftField? = when {
@@ -45,7 +49,9 @@ data class TaskDraft(
         priority = other.priority ?: priority,
         recurrence = if (other.recurrence != Recurrence.NONE) other.recurrence else recurrence,
         notes = other.notes?.takeIf { it.isNotBlank() } ?: notes,
-        reminderMin = other.reminderMin ?: reminderMin
+        reminderMin = other.reminderMin ?: reminderMin,
+        keepOverlaps = keepOverlaps || other.keepOverlaps,
+        hourConfirmed = hourConfirmed || other.hourConfirmed
     )
 
     /** The command that adds this task, or null while a required detail is still missing. */
@@ -53,7 +59,8 @@ data class TaskDraft(
         if (nextMissing() != null) return null
         return TaskCommand.AddTask(
             title!!, deadline, durationMin, priority, recurrence, notes,
-            reminderMin = reminderMin?.takeIf { it != NO_REMINDER }
+            reminderMin = reminderMin?.takeIf { it != NO_REMINDER },
+            keepOverlaps = keepOverlaps
         )
     }
 

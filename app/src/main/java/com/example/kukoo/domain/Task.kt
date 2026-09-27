@@ -76,4 +76,8 @@ interface TaskStore {
     fun update(task: Task)
     fun delete(id: Long): Boolean
     fun deleteAll()
+
+    /** Overlaps the user chose to keep ("keep both"). */
+    fun acks(): Set<OverlapAck>
+    fun addAck(ack: OverlapAck)
 }

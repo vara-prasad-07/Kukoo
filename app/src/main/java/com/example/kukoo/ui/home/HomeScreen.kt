@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Timeline
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -61,6 +62,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.kukoo.domain.ConflictDetector
+import com.example.kukoo.domain.DeadlineResolver
 import com.example.kukoo.domain.Task
 import com.example.kukoo.domain.TimeFormat
 import com.example.kukoo.ui.AppState
@@ -130,6 +133,17 @@ fun HomeScreen(
         }
     }
     val sections = remember(state.tasks, now) { groupTasks(state.tasks, now, clock.zone) }
+    // Which tasks share time with which: shown on the rows, and counted in the banner.
+    val detector = remember(clock) { ConflictDetector(DeadlineResolver(clock)) }
+    val clashes = remember(state.tasks, state.acks, now) { detector.overlaps(state.tasks, now, state.acks) }
+    val clashesByTask = remember(clashes) {
+        val map = mutableMapOf<Long, MutableList<String>>()
+        clashes.forEach { o ->
+            map.getOrPut(o.first.task.id) { mutableListOf() }.add(o.second.task.title)
+            map.getOrPut(o.second.task.id) { mutableListOf() }.add(o.first.task.title)
+        }
+        map
+    }
     val overdue = sections.firstOrNull { it.key == SectionKey.OVERDUE }?.tasks.orEmpty()
     val today = sections.firstOrNull { it.key == SectionKey.TODAY }?.tasks.orEmpty()
     val workMinutes = (overdue + today).sumOf { it.durationMin }
@@ -196,6 +210,12 @@ fun HomeScreen(
                 )
             }
 
+            if (clashes.isNotEmpty()) {
+                item(key = "clashes") {
+                    ClashBanner(count = clashes.size, onClick = onPlan)
+                }
+            }
+
             if (state.loaded && state.tasks.isEmpty()) {
                 item(key = "empty") { EmptyState(onAdd) }
             }
@@ -215,6 +235,7 @@ fun HomeScreen(
                         format = format,
                         now = now,
                         zone = clock.zone,
+                        overlapsWith = clashesByTask[task.id].orEmpty().distinct(),
                         onClick = { onEdit(task) },
                         onToggleDone = { onToggleDone(task) },
                         onDelete = { onDelete(task) },
@@ -297,8 +318,8 @@ private fun SummaryCard(dueToday: Int, overdue: Int, workMinutes: Int, nextCall:
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(Modifier.fillMaxWidth()) {
-                Stat("Due today", dueToday.toString(), Modifier.weight(1f))
-                Stat("Overdue", overdue.toString(), Modifier.weight(1f), highlight = overdue > 0)
+                Stat("Today", dueToday.toString(), Modifier.weight(1f))
+                Stat("Past start", overdue.toString(), Modifier.weight(1f), highlight = overdue > 0)
                 Stat("Work left", if (workMinutes == 0) "–" else shortDuration(workMinutes), Modifier.weight(1.2f))
             }
             if (nextCall != null) {
@@ -342,6 +363,7 @@ private fun TaskRow(
     format: TimeFormat,
     now: Long,
     zone: java.time.ZoneId,
+    overlapsWith: List<String>,
     onClick: () -> Unit,
     onToggleDone: () -> Unit,
     onDelete: () -> Unit,
@@ -418,6 +440,17 @@ private fun TaskRow(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+                if (!task.isDone && overlapsWith.isNotEmpty()) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 2.dp)) {
+                        Icon(Icons.Default.Warning, contentDescription = null, modifier = Modifier.size(14.dp), tint = Danger)
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            text = "Overlaps " + overlapsWith.joinToString(", "),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Danger
+                        )
+                    }
+                }
             }
             if (!task.isDone) {
                 Box(
@@ -449,8 +482,38 @@ private fun TaskRow(
     }
 }
 
+@Composable
+private fun ClashBanner(count: Int, onClick: () -> Unit) {
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = Danger.copy(alpha = 0.12f)),
+        border = BorderStroke(1.dp, Danger.copy(alpha = 0.5f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Warning, contentDescription = null, tint = Danger, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(8.dp))
+            Column {
+                Text(
+                    if (count == 1) "1 overlap" else "$count overlaps",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Danger
+                )
+                Text(
+                    "Tap to see your day, or ask Kukoo \"any conflicts?\"",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
 private fun deadlineLabel(task: Task, format: TimeFormat): String {
-    val d = task.deadline ?: return "No deadline"
+    val d = task.deadline ?: return "No start time"
     val day = format.day(d).replaceFirstChar { it.uppercase() }
     return "$day, ${format.clockTime(d)}"
 }

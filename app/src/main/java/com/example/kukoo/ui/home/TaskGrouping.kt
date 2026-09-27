@@ -5,10 +5,10 @@ import java.time.Instant
 import java.time.ZoneId
 
 enum class SectionKey(val title: String) {
-    OVERDUE("Overdue"),
+    OVERDUE("Past start time"),
     TODAY("Today"),
     UPCOMING("Upcoming"),
-    NO_DEADLINE("No deadline"),
+    NO_DEADLINE("No start time"),
     DONE("Done")
 }
 

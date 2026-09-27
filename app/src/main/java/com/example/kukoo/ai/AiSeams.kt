@@ -1,5 +1,7 @@
 package com.example.kukoo.ai
 
+import com.example.kukoo.domain.ConflictQuestion
+import com.example.kukoo.domain.DraftField
 import com.example.kukoo.domain.TaskCommand
 import com.example.kukoo.domain.TaskDraft
 
@@ -17,8 +19,20 @@ data class ParseContext(
      * The last few turns, oldest first, so a follow-up can be understood at all: "move it to six"
      * and "the second one" mean nothing without what was just said.
      */
-    val history: List<ConversationTurn> = emptyList()
+    val history: List<ConversationTurn> = emptyList(),
+    /**
+     * Set while the assistant is waiting for an answer about an overlap (or an odd start time): the
+     * next utterance is then "yes", "keep both", a new time or a new length, not a fresh command.
+     */
+    val conflict: ConflictQuestion? = null
 ) {
+    /**
+     * The detail a short reply is most likely giving. While a conflict is being settled that is a new
+     * start time, even though the task's own next missing detail may be something else.
+     */
+    fun expectedField(): DraftField? =
+        if (conflict?.forDraft == true) DraftField.DEADLINE else draft?.nextMissing()
+
     companion object {
         /** How many past turns the caller should collect; the parser may use fewer. */
         const val HISTORY_TURNS = 6

@@ -114,6 +114,22 @@ class RuleBasedIntentParserTest {
         parse("Change the deadline to 6 PM.")
     )
 
+    // The app now calls the deadline a "start time"; the words people say must keep working.
+    @Test fun startTimeWording_isUnderstood_asTheOldDeadlineWords() {
+        val last = TaskCommand.UpdateTask(TaskRef.Last, TaskPatch(deadline = rel(h = 18)))
+        assertEquals(last, parse("Change the time to 6 PM."))
+        assertEquals(last, parse("Change the start time to 6 PM."))
+        val named = TaskCommand.UpdateTask(TaskRef.ByTitle("client deck"), TaskPatch(deadline = rel(h = 18)))
+        assertEquals(named, parse("change the start time of the client deck to 6 pm"))
+        assertEquals(named, parse("change the client deck start time to 6 pm"))
+    }
+
+    // The suggestion chips on the voice screen must parse to what they say.
+    @Test fun suggestionChips_parseToTheirCommands() {
+        assertEquals(TaskCommand.QueryTasks(QueryScope.TODAY), parse("What's on today?"))
+        assertEquals(TaskCommand.Replan(PlanScope.AFTERNOON), parse("Replan my afternoon"))
+    }
+
     @Test fun replanAfternoon() =
         assertEquals(TaskCommand.Replan(PlanScope.AFTERNOON), parse("Replan my afternoon."))
 

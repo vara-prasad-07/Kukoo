@@ -18,9 +18,18 @@ class TaskEngine(
 ) {
     private val mutex = Mutex()
     private val resolver = DeadlineResolver(clock, config)
+    private val detector = ConflictDetector(resolver)
+    private val slotFinder = SlotFinder(config, resolver)
     val format = TimeFormat(clock)
 
-    /** The task most recently talked about, so "change the deadline to 6 PM" has a target. */
+    /** What the assistant just offered to do about an overlap, good only for the user's next reply. */
+    @Volatile
+    private var offer: Offer? = null
+
+    /** True while a spoken (or typed) turn is running: only then does an edit start a question. */
+    private var spokenTurn = false
+
+    /** The task most recently talked about, so "change the time to 6 PM" has a target. */
     private var lastTaskId: Long? = null
 
     /** Reverses the last successful mutation. Single step; cleared when a session starts or ends. */
@@ -36,10 +45,28 @@ class TaskEngine(
      */
     val pendingDraft: TaskDraft? get() = draft
 
+    /**
+     * The question about a conflict that is waiting for an answer, or null. A parser needs it to read a
+     * bare "yes", "no" or "keep both", which mean nothing without knowing what was asked.
+     */
+    val pendingConflict: ConflictQuestion?
+        get() {
+            draft?.let { d ->
+                return draftIssue(d)?.let { ConflictQuestion(it.kind, it.suggestion != null, forDraft = true, d.title ?: "the task") }
+            }
+            return offer?.let {
+                ConflictQuestion(
+                    if (it.kind == OfferKind.SCHEDULE) QuestionKind.SCHEDULE else QuestionKind.OVERLAP,
+                    it.slot != null, forDraft = false, it.title
+                )
+            }
+        }
+
     fun resetContext() {
         lastTaskId = null
         undoAction = null
         draft = null
+        offer = null
     }
 
     fun tasks(): List<Task> = store.all()
@@ -55,7 +82,14 @@ class TaskEngine(
      * this way needs a name, a deadline, a duration and a priority: anything missing is asked for,
      * one detail at a time, and the task is only added once all four are known.
      */
-    suspend fun executeSpoken(command: TaskCommand): EngineResult = mutex.withLock { dispatchSpoken(command) }
+    suspend fun executeSpoken(command: TaskCommand): EngineResult = mutex.withLock {
+        spokenTurn = true
+        try {
+            dispatchSpoken(command)
+        } finally {
+            spokenTurn = false
+        }
+    }
 
     private suspend fun dispatch(command: TaskCommand): EngineResult = when (command) {
         is TaskCommand.QueryTasks -> query(command.scope)
@@ -68,6 +102,9 @@ class TaskEngine(
         is TaskCommand.ReopenTask -> setDone(command.ref, done = false)
         is TaskCommand.DeleteTask -> delete(command)
         is TaskCommand.Replan -> replan(command.scope)
+        TaskCommand.CheckConflicts -> checkConflicts()
+        is TaskCommand.FindTime -> findTime(command.durationMin)
+        is TaskCommand.Resolve -> resolve(command.choice, null)
         TaskCommand.Undo -> undo()
         is TaskCommand.Snooze -> snooze(command.minutes)
         TaskCommand.EndCall -> EngineResult(Outcome.END_CALL, "Okay, goodbye. Your tasks are up to date.")
@@ -87,7 +124,7 @@ class TaskEngine(
             is Resolved.Fail -> return r.result
         }
         lastTaskId = task.id
-        val when_ = task.deadline?.let { " It is due ${format.deadline(it)}." }.orEmpty()
+        val when_ = task.deadline?.let { " It starts ${format.deadline(it)}." }.orEmpty()
         return EngineResult(
             Outcome.NEEDS_INFO,
             "What would you like to change about ${task.title}?$when_ " +
@@ -115,14 +152,26 @@ class TaskEngine(
 
     private suspend fun dispatchSpoken(command: TaskCommand): EngineResult {
         val pending = draft
+        // A question about an overlap is only good for the very next thing the user says.
+        val standing = offer
+        offer = null
         return when (command) {
+            is TaskCommand.Resolve -> resolve(command.choice, standing)
+            // "okay" / "yeah" after "should I use that?" is a yes.
+            is TaskCommand.Chat ->
+                if (command.kind == ChatKind.ACKNOWLEDGE && (standing != null || (pending != null && draftIssue(pending) != null))) {
+                    resolve(ConflictChoice.ACCEPT, standing)
+                } else dispatch(command)
+            // "never mind" after an offer means "leave it".
+            TaskCommand.DiscardDraft ->
+                if (pending == null && standing != null) resolve(ConflictChoice.KEEP, standing) else dispatch(command)
+            is TaskCommand.Snooze, is TaskCommand.ReopenTask -> withNewOverlaps(command)
             is TaskCommand.AddTask -> startDraft(TaskDraft.of(command))
             // A misheard "gym every day at 12pm" is still a new task, and needs the same questions.
             is TaskCommand.UpdateTask ->
                 selfHealToAdd(command)?.let { startDraft(TaskDraft.of(it)) } ?: withDraftReminder(command)
             // chat() re-asks the pending question itself, so it must not also get a draft reminder.
-            is TaskCommand.StartTask, is TaskCommand.FillTask, TaskCommand.DiscardDraft,
-            is TaskCommand.Chat -> dispatch(command)
+            is TaskCommand.StartTask, is TaskCommand.FillTask -> dispatch(command)
             is TaskCommand.Unsupported ->
                 if (pending != null) ask(pending, prefix = "Sorry, I didn't catch that. ") else dispatch(command)
             TaskCommand.EndCall -> {
@@ -145,7 +194,9 @@ class TaskEngine(
         val extra = if (today.due.size + today.overdue.size >= 2) {
             " That is about ${format.duration(roundToFive(workload))} of work."
         } else ""
-        return "${format.greeting()}. $core$extra What would you like to do?"
+        // The call is the moment to sort out a clash: say it and ask what to do about it.
+        val clash = todaysClashQuestion()
+        return "${format.greeting()}. $core$extra${clash ?: " What would you like to do?"}"
     }
 
     /**
@@ -161,13 +212,14 @@ class TaskEngine(
             deadline == null -> "Reminder: ${task.title}."
             deadline > now -> {
                 val left = ((deadline - now + MILLIS_PER_MINUTE - 1) / MILLIS_PER_MINUTE).toInt()
-                "Reminder: ${task.title} is due ${format.deadline(deadline)}, in ${spanWord(left)}."
+                "Reminder: ${task.title} starts ${format.deadline(deadline)}, in ${spanWord(left)}."
             }
-            else -> "Reminder: ${task.title} was due ${format.deadline(deadline)}."
+            else -> "Reminder: ${task.title} was due to start ${format.deadline(deadline)}."
         }
         val notes = task.notes?.let { " Your note says: $it." }.orEmpty()
+        val clash = task.deadline?.let { clashQuestionFor(task) }
         return "$lead It takes ${format.duration(task.durationMin)}, ${task.priority.label.lowercase()} priority.$notes " +
-            "Want to mark it done, move it, or change something?"
+            (clash?.trimStart() ?: "Want to mark it done, move it, or change something?")
     }
 
     private fun spanWord(minutes: Int) = if (minutes < 60) format.minutes(minutes) else format.duration(minutes)
@@ -175,9 +227,9 @@ class TaskEngine(
     /** Why [reminderMin] cannot be used for a task due at [deadline], or null when it is fine. */
     private fun reminderError(title: String, deadline: Long?, reminderMin: Int, now: Long): String? {
         if (reminderMin < Task.MIN_REMINDER_MIN || reminderMin > Task.MAX_REMINDER_MIN) {
-            return "A reminder should be between ${Task.MIN_REMINDER_MIN} minute and ${Task.MAX_REMINDER_MIN / 60} hours before the deadline."
+            return "A reminder should be between ${Task.MIN_REMINDER_MIN} minute and ${Task.MAX_REMINDER_MIN / 60} hours before it starts."
         }
-        if (deadline == null) return "A reminder needs a deadline to count back from, so set a deadline for $title first."
+        if (deadline == null) return "A reminder needs a start time to count back from, so set a start time for $title first."
         val rings = deadline - reminderMin * MILLIS_PER_MINUTE
         if (rings <= now) {
             return "A ${spanWord(reminderMin)} reminder for $title would ring ${format.deadline(rings)}, " +
@@ -201,17 +253,17 @@ class TaskEngine(
     }
 
     private fun querySentence(d: DueToday): String {
-        if (d.overdue.isEmpty() && d.due.isEmpty()) return "Nothing is due today."
+        if (d.overdue.isEmpty() && d.due.isEmpty()) return "Nothing is scheduled today."
         val parts = mutableListOf<String>()
         if (d.overdue.isNotEmpty()) {
             val verb = if (d.overdue.size == 1) "task is" else "tasks are"
-            parts += "${d.overdue.size} $verb overdue: ${listWithTimes(d.overdue, withDay = true)}."
+            parts += "${d.overdue.size} $verb past their start time: ${listWithTimes(d.overdue, withDay = true)}."
         }
         parts += if (d.due.isNotEmpty()) {
             val noun = if (d.due.size == 1) "task" else "tasks"
-            "You have ${d.due.size} $noun due today: ${listWithTimes(d.due, withDay = false)}."
+            "You have ${d.due.size} $noun today: ${listWithTimes(d.due, withDay = false)}."
         } else {
-            "Nothing else is due today."
+            "Nothing else is scheduled today."
         }
         return parts.joinToString(" ")
     }
@@ -243,7 +295,7 @@ class TaskEngine(
         val shown = tasks.take(MAX_SPOKEN_ITEMS).map { t ->
             val d = t.deadline
             when {
-                d == null -> "${t.title}, no deadline"
+                d == null -> "${t.title}, no start time"
                 withDay -> "${t.title}, ${format.deadline(d)}"
                 else -> "${t.title} at ${format.clockTime(d)}"
             }
@@ -291,7 +343,7 @@ class TaskEngine(
         }
         val endOfToday = resolver.endOfDay(resolver.today())
         val targets = store.all().filter { !it.isDone && it.deadline != null && it.deadline <= endOfToday }
-        if (targets.isEmpty()) return EngineResult(Outcome.OK, "Nothing is due today, so there is nothing to snooze.")
+        if (targets.isEmpty()) return EngineResult(Outcome.OK, "Nothing is scheduled today, so there is nothing to snooze.")
 
         val shift = minutes * MILLIS_PER_MINUTE
         targets.forEach { store.update(it.copy(deadline = it.deadline!! + shift)) }
@@ -348,14 +400,20 @@ class TaskEngine(
             }
         }
         incoming.deadline?.let { spec ->
-            val at = resolver.resolve(spec, existing = null)
+            // "tomorrow" on its own moves the day and keeps the time already given.
+            val current = base.deadline?.let { resolver.resolve(it, existing = null) }
+            val at = resolver.resolve(spec, existing = current)
             if (at < now) problems += "${format.deadline(at).replaceFirstChar { it.uppercase() }} has already passed."
-            else { d = d.copy(deadline = spec); heard += "due ${format.deadline(at)}" }
+            else {
+                val stored = if (current != null && spec is DeadlineSpec.Relative) DeadlineSpec.Exact(at) else spec
+                d = d.copy(deadline = stored, keepOverlaps = false, hourConfirmed = false)
+                heard += "starts ${format.deadline(at)}"
+            }
         }
         incoming.durationMin?.let { minutes ->
             val error = durationError(minutes)
             if (error != null) problems += error
-            else { d = d.copy(durationMin = minutes); heard += format.duration(minutes) }
+            else { d = d.copy(durationMin = minutes, keepOverlaps = false); heard += format.duration(minutes) }
         }
         incoming.priority?.let { d = d.copy(priority = it); heard += "${it.label.lowercase()} priority" }
         if (incoming.recurrence != Recurrence.NONE) {
@@ -418,7 +476,7 @@ class TaskEngine(
         // Too close to the deadline for any reminder call: say so instead of asking a question with no answer.
         val noRoomForReminder = merged.nextMissing() == DraftField.REMINDER && reminderOptions(merged).isEmpty()
         if (noRoomForReminder) merged = merged.copy(reminderMin = TaskDraft.NO_REMINDER)
-        if (merged.nextMissing() == null) return finishDraft(merged, noRoomForReminder)
+        if (merged.nextMissing() == null && draftIssue(merged) == null) return finishDraft(merged, noRoomForReminder)
 
         draft = merged
         val sorry = if (apologizeIfNothingNew && absorbed.heard.isEmpty() && absorbed.problems.isEmpty()) {
@@ -434,18 +492,25 @@ class TaskEngine(
         heard: List<String> = emptyList(),
         problems: List<String> = emptyList()
     ): EngineResult {
+        // The question about a 3 AM start names the time itself, so it is not read back first as well.
+        val told = if (draftIssue(d) is DraftIssue.OddHour) heard.filterNot { it.startsWith("starts ") } else heard
         val spoken = buildString {
             append(prefix)
             problems.forEach { append(it).append(' ') }
-            if (heard.isNotEmpty()) append("Got it: ").append(heard.joinToString(", ")).append(". ")
+            if (told.isNotEmpty()) append("Got it: ").append(told.joinToString(", ")).append(". ")
             append(question(d))
         }
         return EngineResult(Outcome.NEEDS_INFO, spoken)
     }
 
-    private fun question(d: TaskDraft): String = when (d.nextMissing()) {
+    private fun question(d: TaskDraft): String {
+        draftIssue(d)?.let { return issueQuestion(d, it) }
+        return fieldQuestion(d)
+    }
+
+    private fun fieldQuestion(d: TaskDraft): String = when (d.nextMissing()) {
         DraftField.TITLE, null -> "What should I call the task?"
-        DraftField.DEADLINE -> "When is ${d.title} due?"
+        DraftField.DEADLINE -> "When should ${d.title} start?"
         DraftField.DURATION -> "How long will ${d.title} take?"
         DraftField.PRIORITY -> "Is ${d.title} high, medium or low priority?"
         DraftField.REMINDER -> reminderQuestion(d)
@@ -486,7 +551,7 @@ class TaskEngine(
         val result = add(complete.toAddTask()!!)
         // The plain add() sentence never mentions priority, which is now always a spoken answer.
         return if (result.isSuccess) {
-            val noReminder = if (noRoomForReminder) " There isn't enough time before the deadline for a reminder call." else ""
+            val noReminder = if (noRoomForReminder) " There isn't enough time before the start time for a reminder call." else ""
             result.copy(spoken = "${result.spoken} ${complete.priority!!.label} priority.$noReminder")
         } else result
     }
@@ -531,7 +596,7 @@ class TaskEngine(
         )
         lastTaskId = saved.id
         undoAction = { store.delete(saved.id); if (lastTaskId == saved.id) lastTaskId = null }
-        val whenPart = if (deadline != null) "due ${format.deadline(deadline)}" else "with no deadline"
+        val whenPart = if (deadline != null) "starting ${format.deadline(deadline)}" else "with no start time"
         if (cmd.recurrence != Recurrence.NONE && deadline != null &&
             (cmd.deadline as? DeadlineSpec.Relative)?.day.let { it == null || it == DayRef.Today } &&
             cmd.deadline is DeadlineSpec.Relative &&
@@ -540,19 +605,21 @@ class TaskEngine(
             // Today's time had already passed, so the series starts tomorrow.
             return EngineResult(
                 Outcome.OK,
-                "Added '$title' starting ${format.deadline(deadline)} (repeats ${recurrenceWord(cmd.recurrence)}).",
+                "Added '$title' starting ${format.deadline(deadline)} (repeats ${recurrenceWord(cmd.recurrence)})." +
+                    overlapNoteForNew(saved, cmd.keepOverlaps),
                 taskIds = listOf(saved.id)
             )
         }
         val repeats = if (cmd.recurrence != Recurrence.NONE) " Repeats ${repeatWord(cmd.recurrence)}." else ""
         val alsoHave = duplicate?.let { other ->
-            val other_ = other.deadline?.let { format.deadline(it) } ?: "no deadline"
+            val other_ = other.deadline?.let { format.deadline(it) } ?: "no start time"
             " You already had another $title, $other_."
         }.orEmpty()
         val reminder = cmd.reminderMin?.let { " I'll call you ${spanWord(it)} before." }.orEmpty()
         return EngineResult(
             Outcome.OK,
-            "Added $title, $whenPart, ${format.duration(duration)}.$repeats$reminder$alsoHave",
+            "Added $title, $whenPart, ${format.duration(duration)}.$repeats$reminder$alsoHave" +
+                overlapNoteForNew(saved, cmd.keepOverlaps),
             taskIds = listOf(saved.id)
         )
     }
@@ -585,7 +652,7 @@ class TaskEngine(
         if (patch.clearDeadline) {
             if (task.deadline != null) {
                 updated = updated.copy(deadline = null)
-                changes += "no deadline"
+                changes += "no start time"
                 deadlineOnly = true
             }
         } else if (patch.deadline != null) {
@@ -595,7 +662,7 @@ class TaskEngine(
                     return reject("${format.deadline(resolved)} has already passed, so I left ${task.title} unchanged.")
                 }
                 updated = updated.copy(deadline = resolved)
-                changes += "due ${format.deadline(resolved)}"
+                changes += "starts ${format.deadline(resolved)}"
                 deadlineOnly = true
             }
         }
@@ -662,17 +729,19 @@ class TaskEngine(
 
         lastTaskId = task.id
         if (changes.isEmpty()) {
+            if (patch.keepOverlaps) ackOverlaps(task)
             return EngineResult(Outcome.OK, "${task.title} is already set that way.", taskIds = listOf(task.id))
         }
         store.update(updated)
         undoAction = { store.update(task) }
+        val overlapTail = overlapTailForEdit(task, updated, patch.keepOverlaps)
 
         val spoken = when {
-            deadlineOnly && patch.clearDeadline -> "Done. ${updated.title} no longer has a deadline."
-            deadlineOnly -> "Done. ${updated.title} is now due ${format.deadline(updated.deadline!!)}."
+            deadlineOnly && patch.clearDeadline -> "Done. ${updated.title} no longer has a start time."
+            deadlineOnly -> "Done. ${updated.title} now starts ${format.deadline(updated.deadline!!)}."
             else -> "Updated ${updated.title}: ${changes.joinToString(", ")}."
         }
-        return EngineResult(Outcome.OK, spoken, taskIds = listOf(task.id))
+        return EngineResult(Outcome.OK, spoken + overlapTail, taskIds = listOf(task.id))
     }
 
     private fun setDone(ref: TaskRef, done: Boolean): EngineResult {
@@ -708,7 +777,7 @@ class TaskEngine(
             )
             ids += next.id
             undoAction = { store.update(task); store.delete(next.id) }
-            spoken += next.deadline?.let { " The next one is due ${format.deadline(it)}." }
+            spoken += next.deadline?.let { " The next one starts ${format.deadline(it)}." }
                 ?: " It will come back ${repeatWord(task.recurrence)}."
         }
         return EngineResult(Outcome.OK, spoken, taskIds = ids)
@@ -726,53 +795,367 @@ class TaskEngine(
         return EngineResult(Outcome.OK, "Done. I deleted ${task.title}.", taskIds = listOf(task.id))
     }
 
-    // ---- replanning ----------------------------------------------------------------------
+    // ---- the day plan ----------------------------------------------------------------------
 
     private suspend fun replan(scope: PlanScope): EngineResult {
         val now = clock.millis()
         val today = resolver.today()
-        val startHour = if (scope == PlanScope.AFTERNOON) config.afternoonStartHour else config.workStartHour
 
-        // If today's window is (almost) over, plan tomorrow's instead and say so.
-        val todayEnd = resolver.at(today, config.workEndHour)
-        val date = if (now > todayEnd - config.slotMin * MILLIS_PER_MINUTE) today.plusDays(1) else today
-        val window = TimeRange(resolver.at(date, startHour), resolver.at(date, config.workEndHour))
-
-        val endOfPlanDay = resolver.endOfDay(date)
-        val tasks = store.all().filter { !it.isDone && (it.deadline == null || it.deadline <= endOfPlanDay) }
+        // If today's waking hours are (almost) over, plan tomorrow's instead and say so.
+        val awakeEnd = resolver.at(today, config.awakeEndHour)
+        val date = if (now > awakeEnd - config.slotMin * MILLIS_PER_MINUTE) today.plusDays(1) else today
 
         val plan = try {
-            replanner.replan(PlanRequest(tasks, window, emptyList(), scope, date, now))
+            replanner.replan(PlanRequest(store.all().filter { !it.isDone }, store.acks(), scope, date, now, clock.zone))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             return reject("I couldn't compute the plan: ${e.message ?: "unknown error"}.")
         }
-        return EngineResult(Outcome.OK, narrate(plan), taskIds = plan.blocks.map { it.taskId }.distinct(), plan = plan)
+        val question = if (spokenTurn) planQuestion(plan) else ""
+        return EngineResult(
+            Outcome.OK, narrate(plan) + question,
+            taskIds = plan.blocks.map { it.taskId }.distinct(), plan = plan
+        )
     }
 
     private fun narrate(plan: Plan): String {
         val whenWord = if (plan.date == resolver.today()) "" else " for ${format.day(plan.date)}"
-        if (plan.isEmpty) return "There is nothing to schedule in your ${plan.scope.label}$whenWord."
+        if (plan.isEmpty) return "There is nothing scheduled in your ${plan.scope.label}$whenWord."
 
         val parts = mutableListOf("Here is your ${plan.scope.label} plan$whenWord.")
         val shown = plan.blocks.take(MAX_SPOKEN_ITEMS)
         shown.forEach {
-            parts += "${format.clockTime(it.start)}, ${it.title}, ${format.duration(it.minutes)}."
+            val lead = if (it.proposed) "Suggested: " else ""
+            parts += "$lead${format.clockTime(it.start)}, ${it.title}, ${format.duration(it.minutes)}."
         }
         if (plan.blocks.size > shown.size) parts += "And ${plan.blocks.size - shown.size} more."
 
         if (plan.conflicts.isEmpty()) {
-            parts += "Everything fits before its deadline."
+            parts += "No conflicts."
         } else {
-            plan.conflicts.forEach { c ->
-                parts += when (c.kind) {
-                    ConflictKind.LATE -> "Conflict: ${c.title} finishes ${format.minutes(c.minutes)} after its deadline."
-                    ConflictKind.NO_ROOM -> "Conflict: ${c.title} does not fit; ${format.minutes(c.minutes)} of it can't be scheduled."
+            plan.conflicts.take(2).forEach { c ->
+                parts += "Conflict: ${c.firstTitle} and ${c.secondTitle} overlap by ${spanWord(c.minutes)}, " +
+                    "${whenRange(c.start, c.end)}."
+            }
+            if (plan.conflicts.size > 2) parts += "And ${plan.conflicts.size - 2} more."
+        }
+        if (plan.unplaced.isNotEmpty()) parts += "There's no room today for ${naturalJoin(plan.unplaced.take(3))}."
+        return parts.joinToString(" ")
+    }
+
+    /** After the plan is read out: offer to fix the first overlap, or else to schedule the first suggestion. */
+    private fun planQuestion(plan: Plan): String {
+        val clash = plan.conflicts.firstOrNull()
+        if (clash != null) {
+            currentOverlaps().firstOrNull {
+                it.range.start == clash.start && it.involves(clash.firstId) && it.involves(clash.secondId)
+            }?.let { return fixQuestion(it) }
+        }
+        val proposal = plan.blocks.filter { it.proposed }
+            .sortedWith(compareByDescending<ScheduledBlock> { it.priority.rank }.thenByDescending { it.minutes }.thenBy { it.taskId })
+            .firstOrNull() ?: return ""
+        offer = Offer(OfferKind.SCHEDULE, proposal.taskId, proposal.title, proposal.start)
+        return " Want me to schedule ${proposal.title} for ${format.deadline(proposal.start)}?"
+    }
+
+    // ---- conflicts -----------------------------------------------------------------------
+
+    private enum class OfferKind { FIX_OVERLAP, SCHEDULE }
+
+    /** [slot] is the time the assistant suggested, or null when there was no free time to suggest. */
+    private data class Offer(val kind: OfferKind, val taskId: Long, val title: String, val slot: Long?)
+
+    /** A problem with the task being set up that has to be settled before it is saved. */
+    private sealed interface DraftIssue {
+        val kind: QuestionKind
+        val suggestion: Long?
+
+        data class Overlaps(val start: Long, val overlaps: List<Overlap>, override val suggestion: Long?) : DraftIssue {
+            override val kind: QuestionKind get() = QuestionKind.OVERLAP
+        }
+
+        data class OddHour(val start: Long, override val suggestion: Long?) : DraftIssue {
+            override val kind: QuestionKind get() = QuestionKind.ODD_HOUR
+        }
+    }
+
+    private fun currentOverlaps(): List<Overlap> = detector.overlaps(store.all(), clock.millis(), store.acks())
+
+    private fun overlapsWith(candidate: Task): List<Overlap> =
+        detector.overlapsWith(store.all(), candidate, clock.millis(), store.acks())
+
+    private fun draftCandidate(d: TaskDraft, start: Long) = Task(
+        id = DRAFT_ID,
+        title = d.title ?: "",
+        deadline = start,
+        durationMin = d.durationMin ?: Task.DEFAULT_DURATION_MIN,
+        priority = d.priority ?: Priority.MEDIUM,
+        createdAt = clock.millis(),
+        recurrence = d.recurrence
+    )
+
+    /**
+     * What is wrong with the task being set up, or null. The hour is checked as soon as it is known (3 AM is
+     * nearly always a misheard 3 PM); an overlap once the length is known too.
+     */
+    private fun draftIssue(d: TaskDraft): DraftIssue? {
+        val spec = d.deadline ?: return null
+        val now = clock.millis()
+        val start = resolver.resolve(spec, existing = null)
+
+        if (!d.hourConfirmed && resolver.toLocal(start).hour < config.oddHourEndHour) {
+            val flipped = start + 12 * 60 * MILLIS_PER_MINUTE
+            return DraftIssue.OddHour(start, flipped.takeIf { it > now })
+        }
+        if (d.durationMin == null || d.keepOverlaps) return null
+        val candidate = draftCandidate(d, start)
+        val tasks = store.all()
+        val overlaps = detector.overlapsWith(tasks, candidate, now, store.acks())
+        if (overlaps.isEmpty()) return null
+        return DraftIssue.Overlaps(start, overlaps, slotFinder.suggestFor(tasks, candidate, now, detector))
+    }
+
+    /** "3 PM to 3:30 PM", or with the day when it is not today. */
+    private fun whenRange(start: Long, end: Long): String {
+        val core = "from ${format.clockTime(start)} to ${format.clockTime(end)}"
+        val day = format.day(start)
+        return if (day == "today") core else "$day $core"
+    }
+
+    private fun pairSentence(o: Overlap): String =
+        "${o.first.task.title} and ${o.second.task.title} overlap by ${spanWord(o.minutes)}, " +
+            "${whenRange(o.range.start, o.range.end)}."
+
+    private fun describeOverlaps(list: List<Overlap>): String {
+        val more = if (list.size > 2) " And ${list.size - 2} more." else ""
+        return list.take(2).joinToString(" ") { pairSentence(it) } + more
+    }
+
+    /** What [task] runs into, for "it overlaps Standup, from 9 AM to 9:30 AM." */
+    private fun headsUpBody(task: Task, overlaps: List<Overlap>): String {
+        val others = overlaps.map { it.other(task.id) }.distinctBy { it.task.id }
+        if (others.size == 1) {
+            val o = others[0]
+            return "it overlaps ${o.task.title}, ${whenRange(o.start, o.end)}."
+        }
+        val names = others.take(2).map { it.task.title } + listOfNotNull(
+            if (others.size > 2) "${others.size - 2} more" else null
+        )
+        return "it overlaps ${naturalJoin(names)}."
+    }
+
+    private fun issueQuestion(d: TaskDraft, issue: DraftIssue): String {
+        val title = d.title ?: "The task"
+        return when (issue) {
+            is DraftIssue.OddHour -> {
+                val at = format.deadline(issue.start)
+                if (issue.suggestion != null) {
+                    "$title would start $at, in the middle of the night. Did you mean ${format.deadline(issue.suggestion)}?"
+                } else "$title would start $at, in the middle of the night. Is that right?"
+            }
+            is DraftIssue.Overlaps -> {
+                val at = format.deadline(issue.start)
+                val others = issue.overlaps.map { it.other(DRAFT_ID) }.distinctBy { it.task.id }
+                val what = if (others.size == 1) {
+                    "${others[0].task.title}, ${whenRange(others[0].start, others[0].end)}"
+                } else {
+                    naturalJoin(
+                        others.take(2).map { it.task.title } +
+                            listOfNotNull(if (others.size > 2) "${others.size - 2} more" else null)
+                    )
                 }
+                val ask = issue.suggestion?.let {
+                    "I can fit it ${format.deadline(it)} instead. Should I use that, pick another time, or keep both?"
+                } ?: "I couldn't find a free slot this week. What other time works, or should I keep both?"
+                "$title $at would overlap $what. $ask"
             }
         }
-        return parts.joinToString(" ")
+    }
+
+    /** The answer to the open question, whether it is about a task being set up or one just changed. */
+    private fun resolve(choice: ConflictChoice, standing: Offer?): EngineResult {
+        val d = draft
+        if (d != null) {
+            val issue = draftIssue(d) ?: return ask(d, prefix = "Sorry, I didn't catch that. ")
+            return resolveDraft(d, issue, choice)
+        }
+        return if (standing != null) resolveOffer(standing, choice) else reject("There is nothing to decide right now.")
+    }
+
+    private fun resolveDraft(d: TaskDraft, issue: DraftIssue, choice: ConflictChoice): EngineResult {
+        val title = d.title ?: "The task"
+        return when (issue) {
+            is DraftIssue.OddHour -> when {
+                choice == ConflictChoice.ACCEPT && issue.suggestion != null -> useDraftTime(d, issue.suggestion)
+                // "No" and "that's right" both mean the early hour is what they want.
+                else -> progress(
+                    d.copy(hourConfirmed = true), TaskDraft(),
+                    prefix = "Okay, ${format.deadline(issue.start)}. ", apologizeIfNothingNew = false
+                )
+            }
+            is DraftIssue.Overlaps -> when (choice) {
+                ConflictChoice.ACCEPT ->
+                    issue.suggestion?.let { useDraftTime(d, it) }
+                        ?: ask(d, prefix = "I don't have a free time to offer. ")
+                ConflictChoice.KEEP -> progress(
+                    d.copy(keepOverlaps = true), TaskDraft(), prefix = "Okay, I'll keep both. ",
+                    apologizeIfNothingNew = false
+                )
+                ConflictChoice.DECLINE -> EngineResult(
+                    Outcome.NEEDS_INFO, "Okay. What time would you like for $title instead? Or say keep both."
+                )
+            }
+        }
+    }
+
+    private fun useDraftTime(d: TaskDraft, slot: Long): EngineResult = progress(
+        d.copy(deadline = DeadlineSpec.Exact(slot), keepOverlaps = false, hourConfirmed = false), TaskDraft(),
+        prefix = "Okay, ${d.title} starts ${format.deadline(slot)}. ", apologizeIfNothingNew = false
+    )
+
+    private fun resolveOffer(o: Offer, choice: ConflictChoice): EngineResult {
+        if (choice == ConflictChoice.ACCEPT) {
+            val slot = o.slot
+            if (slot == null) {
+                offer = o
+                return EngineResult(
+                    Outcome.NEEDS_INFO,
+                    "I don't have a free time to offer. Tell me a time for ${o.title}, or say keep both."
+                )
+            }
+            lastTaskId = o.taskId
+            val moved = update(TaskCommand.UpdateTask(TaskRef.ById(o.taskId), TaskPatch(deadline = DeadlineSpec.Exact(slot))))
+            if (!moved.isSuccess || o.kind != OfferKind.SCHEDULE || offer != null) return moved
+            return moved.copy(spoken = moved.spoken + nextScheduleQuestion())
+        }
+        // Keep both, no, or never mind: leave things as they are, and remember it so it is not raised again.
+        return if (o.kind == OfferKind.FIX_OVERLAP) {
+            store.get(o.taskId)?.let { ackOverlaps(it) }
+            EngineResult(Outcome.OK, "Okay, I'll keep both.", taskIds = listOf(o.taskId))
+        } else {
+            EngineResult(Outcome.OK, "Okay, I'll leave ${o.title} without a start time.", taskIds = listOf(o.taskId))
+        }
+    }
+
+    /** "Keep both": stop reporting the overlaps [task] has right now. */
+    private fun ackOverlaps(task: Task) {
+        detector.overlaps(store.all(), clock.millis(), emptySet())
+            .filter { it.involves(task.id) }
+            .forEach { store.addAck(it.ack) }
+    }
+
+    private fun overlapNoteForNew(saved: Task, keep: Boolean): String {
+        if (saved.deadline == null) return ""
+        if (keep) {
+            ackOverlaps(saved)
+            return ""
+        }
+        val overlaps = overlapsWith(saved)
+        return if (overlaps.isEmpty()) "" else " Heads up: ${headsUpBody(saved, overlaps)}"
+    }
+
+    /**
+     * After an edit: says which overlaps it *created* (not ones that were already there) and, in
+     * conversation, offers to move the edited task to the nearest free time.
+     */
+    private fun overlapTailForEdit(before: Task, after: Task, keep: Boolean): String {
+        if (after.deadline == null) return ""
+        if (keep) {
+            ackOverlaps(after)
+            return ""
+        }
+        val had = overlapsWith(before).map { it.ack }.toSet()
+        val created = overlapsWith(after).filter { it.ack !in had }
+        if (created.isEmpty()) return ""
+        lastTaskId = after.id
+        val body = " Heads up: ${headsUpBody(after, created)}"
+        if (!spokenTurn || draft != null) return body
+
+        val slot = slotFinder.suggestFor(store.all(), after, clock.millis(), detector)
+        offer = Offer(OfferKind.FIX_OVERLAP, after.id, after.title, slot)
+        return body + if (slot != null) " Want me to move ${after.title} to ${format.deadline(slot)}, or keep both?"
+        else " I couldn't find a free slot this week. Tell me another time, or say keep both."
+    }
+
+    /** Snooze and reopen can push tasks into each other: say so, since the user did not ask about conflicts. */
+    private suspend fun withNewOverlaps(command: TaskCommand): EngineResult {
+        val before = currentOverlaps().map { it.ack }.toSet()
+        val result = withDraftReminder(command)
+        if (!result.isSuccess) return result
+        val added = currentOverlaps().filter { it.ack !in before }
+        if (added.isEmpty()) return result
+        return result.copy(spoken = "${result.spoken} Heads up: ${describeOverlaps(added)} Ask me about conflicts and I'll help sort it out.")
+    }
+
+    /** Offers to move whichever task of [o] matters less and can be moved, to the nearest free time. */
+    private fun fixQuestion(o: Overlap): String {
+        val mover = listOf(o.first, o.second).filter { it.isRowStart }
+            .minWithOrNull(compareBy<Occurrence>({ it.task.priority.rank }, { -it.start }, { -it.task.id }))
+            ?: return ""
+        val task = mover.task
+        val slot = slotFinder.suggestFor(store.all(), task, clock.millis(), detector)
+        offer = Offer(OfferKind.FIX_OVERLAP, task.id, task.title, slot)
+        return if (slot != null) " Want me to move ${task.title} to ${format.deadline(slot)}, or keep both?"
+        else " I couldn't find a free slot this week for ${task.title}. Tell me another time, or say keep both."
+    }
+
+    private fun checkConflicts(): EngineResult {
+        val overlaps = currentOverlaps()
+        if (overlaps.isEmpty()) return EngineResult(Outcome.OK, "You have no overlapping tasks.")
+        val head = if (overlaps.size == 1) "You have 1 overlap." else "You have ${overlaps.size} overlaps."
+        val ask = if (spokenTurn) fixQuestion(overlaps.first()) else ""
+        return EngineResult(
+            Outcome.OK, "$head ${describeOverlaps(overlaps)}$ask",
+            taskIds = overlaps.flatMap { listOf(it.first.task.id, it.second.task.id) }.distinct()
+        )
+    }
+
+    private fun findTime(durationMin: Int?): EngineResult {
+        val minutes = durationMin ?: Task.DEFAULT_DURATION_MIN
+        durationError(minutes)?.let { return reject(it) }
+        val now = clock.millis()
+        val busy = detector.occurrences(store.all(), now).map { it.range }
+        val slot = slotFinder.find(minutes, now, now, busy)
+            ?: return EngineResult(Outcome.OK, "I couldn't find ${format.duration(minutes)} free in the next week.")
+        return EngineResult(Outcome.OK, "Your next free ${format.duration(minutes)} is ${format.deadline(slot)}.")
+    }
+
+    /** The opening of the daily call when tasks overlap today: say so and ask what to do. */
+    private fun todaysClashQuestion(): String? {
+        val endOfToday = resolver.endOfDay(resolver.today())
+        val overlaps = currentOverlaps().filter { it.range.start <= endOfToday }
+        val first = overlaps.firstOrNull() ?: return null
+        val head = if (overlaps.size == 1) " You have an overlap today: ${pairSentence(first)}"
+        else " You have ${overlaps.size} overlaps today. The first: ${pairSentence(first)}"
+        return head + fixQuestion(first)
+    }
+
+    /** The opening of a reminder call for a task that overlaps another: say so and offer to move it. */
+    private fun clashQuestionFor(task: Task): String? {
+        val o = currentOverlaps().firstOrNull { it.involves(task.id) } ?: return null
+        val other = o.other(task.id)
+        val body = " It overlaps ${other.task.title}, ${whenRange(other.start, other.end)}."
+        if (!o.mine(task.id).isRowStart) return body
+        val slot = slotFinder.suggestFor(store.all(), task, clock.millis(), detector)
+        offer = Offer(OfferKind.FIX_OVERLAP, task.id, task.title, slot)
+        return body + if (slot != null) " Want me to move ${task.title} to ${format.deadline(slot)}, or keep both?"
+        else " I couldn't find a free slot this week for it. Tell me another time, or say keep both."
+    }
+
+    /** After scheduling one task with no start time: offer the next one, if there is room for it. */
+    private fun nextScheduleQuestion(): String {
+        val now = clock.millis()
+        val tasks = store.all()
+        val busy = detector.occurrences(tasks, now).map { it.range }
+        val candidates = tasks.filter { !it.isDone && it.deadline == null && it.durationMin > 0 }
+            .sortedWith(compareByDescending<Task> { it.priority.rank }.thenByDescending { it.durationMin }.thenBy { it.id })
+        for (t in candidates) {
+            val slot = slotFinder.find(t.durationMin, now, now, busy) ?: continue
+            offer = Offer(OfferKind.SCHEDULE, t.id, t.title, slot)
+            return " Want me to schedule ${t.title} for ${format.deadline(slot)}?"
+        }
+        return ""
     }
 
     // ---- helpers -------------------------------------------------------------------------
@@ -848,10 +1231,11 @@ class TaskEngine(
 
     private companion object {
         const val CAPABILITIES =
-            "I can tell you what's due, add a task, move one to a different time, change how long " +
+            "I can tell you what's on today, add a task, move one to a different time, change how long " +
                 "it takes or how important it is, mark one done, delete one, or replan your afternoon. " +
                 "What would you like to do?"
         const val MAX_SPOKEN_ITEMS = 4
+        const val DRAFT_ID = -1L
         const val MAX_SUGGESTED_REMINDERS = 3
         const val MAX_SNOOZE_MIN = 24 * 60
         const val MAX_CATCH_UP = 400

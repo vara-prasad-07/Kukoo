@@ -58,11 +58,11 @@ class AddTaskDialogTest {
         r.say(TaskCommand.StartTask())
 
         val afterName = r.fill(TaskDraft(title = "call mom"))
-        assertEquals("Got it: Call mom. When is Call mom due?", afterName.spoken)
+        assertEquals("Got it: Call mom. When should Call mom start?", afterName.spoken)
         assertTrue(r.store.all().isEmpty())
 
         val afterWhen = r.fill(TaskDraft(deadline = tomorrowAt(18)))
-        assertEquals("Got it: due tomorrow at 6 PM. How long will Call mom take?", afterWhen.spoken)
+        assertEquals("Got it: starts tomorrow at 6 PM. How long will Call mom take?", afterWhen.spoken)
         assertTrue(r.store.all().isEmpty())
 
         val afterLength = r.fill(TaskDraft(durationMin = 30))
@@ -81,7 +81,7 @@ class AddTaskDialogTest {
         val done = r.fill(TaskDraft(reminderMin = 15))
         assertEquals(Outcome.OK, done.outcome)
         assertEquals(
-            "Added Call mom, due tomorrow at 6 PM, 30 minutes. I'll call you 15 minutes before. High priority.",
+            "Added Call mom, starting tomorrow at 6 PM, 30 minutes. I'll call you 15 minutes before. High priority.",
             done.spoken
         )
 
@@ -101,7 +101,7 @@ class AddTaskDialogTest {
         r.say(TaskCommand.AddTask("call mom", tomorrowAt(18), 30, Priority.HIGH))
         val done = r.fill(TaskDraft(reminderMin = TaskDraft.NO_REMINDER))
         assertEquals(Outcome.OK, done.outcome)
-        assertEquals("Added Call mom, due tomorrow at 6 PM, 30 minutes. High priority.", done.spoken)
+        assertEquals("Added Call mom, starting tomorrow at 6 PM, 30 minutes. High priority.", done.spoken)
         assertNull(r.store.all().single().reminderMin)
     }
 
@@ -130,7 +130,7 @@ class AddTaskDialogTest {
         val r = rig()
         val res = r.say(TaskCommand.AddTask("Gym", DeadlineSpec.Exact(today(15, 2)), 30, Priority.HIGH))
         assertEquals(Outcome.OK, res.outcome)
-        assertTrue(res.spoken, res.spoken.endsWith("There isn't enough time before the deadline for a reminder call."))
+        assertTrue(res.spoken, res.spoken.endsWith("There isn't enough time before the start time for a reminder call."))
         assertNull(r.store.all().single().reminderMin)
     }
 
@@ -160,7 +160,7 @@ class AddTaskDialogTest {
         val res = r.say(TaskCommand.AddTask("finish the report", tomorrowAt(17), 45))
         assertEquals(Outcome.NEEDS_INFO, res.outcome)
         assertEquals(
-            "Got it: Finish the report, due tomorrow at 5 PM, 45 minutes. " +
+            "Got it: Finish the report, starts tomorrow at 5 PM, 45 minutes. " +
                 "Is Finish the report high, medium or low priority?",
             res.spoken
         )
@@ -189,7 +189,7 @@ class AddTaskDialogTest {
     fun aNamelessDraftKeepsItsDetails_whenTheNameArrivesAsANewTask() {
         val r = rig()
         val first = r.say(TaskCommand.StartTask(TaskDraft(deadline = tomorrowAt(17))))
-        assertEquals("Got it: due tomorrow at 5 PM. What should I call the task?", first.spoken)
+        assertEquals("Got it: starts tomorrow at 5 PM. What should I call the task?", first.spoken)
 
         // A parser that hears the name as "add call mom" must not throw the deadline away.
         val res = r.say(TaskCommand.AddTask("call mom"))
@@ -227,7 +227,7 @@ class AddTaskDialogTest {
         val res = r.fill(TaskDraft(deadline = DeadlineSpec.Exact(today(9))))
         assertEquals(Outcome.NEEDS_INFO, res.outcome)
         assertTrue(res.spoken, res.spoken.contains("has already passed."))
-        assertTrue(res.spoken, res.spoken.endsWith("When is Call mom due?"))
+        assertTrue(res.spoken, res.spoken.endsWith("When should Call mom start?"))
         assertNull(r.engine.pendingDraft?.deadline)
     }
 
@@ -290,7 +290,7 @@ class AddTaskDialogTest {
         r.say(TaskCommand.AddTask("call mom"))
         val res = r.say(TaskCommand.AddTask("buy milk"))
         assertEquals(
-            "Dropping the unfinished Call mom. Got it: Buy milk. When is Buy milk due?",
+            "Dropping the unfinished Call mom. Got it: Buy milk. When should Buy milk start?",
             res.spoken
         )
         assertEquals("Buy milk", r.engine.pendingDraft?.title)
@@ -313,7 +313,7 @@ class AddTaskDialogTest {
         val res = r.say(TaskCommand.QueryTasks())
         assertEquals(Outcome.OK, res.outcome)
         assertTrue(res.spoken, res.spoken.contains("Follow-up"))
-        assertTrue(res.spoken, res.spoken.endsWith("Back to Call mom. When is Call mom due?"))
+        assertTrue(res.spoken, res.spoken.endsWith("Back to Call mom. When should Call mom start?"))
         assertNotNull(r.engine.pendingDraft)
     }
 
@@ -324,7 +324,7 @@ class AddTaskDialogTest {
             TaskCommand.UpdateTask(TaskRef.ByTitle("gym"), TaskPatch(deadline = tomorrowAt(7)))
         )
         assertEquals(Outcome.NEEDS_INFO, res.outcome)
-        assertTrue(res.spoken, res.spoken.startsWith("Got it: Gym, due tomorrow at 7 AM."))
+        assertTrue(res.spoken, res.spoken.startsWith("Got it: Gym, starts tomorrow at 7 AM."))
         assertTrue(r.store.all().isEmpty())
     }
 }

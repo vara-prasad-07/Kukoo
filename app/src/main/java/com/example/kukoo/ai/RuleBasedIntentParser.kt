@@ -1,6 +1,7 @@
 package com.example.kukoo.ai
 
 import com.example.kukoo.domain.ChatKind
+import com.example.kukoo.domain.ConflictQuestion
 import com.example.kukoo.domain.DayRef
 import com.example.kukoo.domain.DeadlineSpec
 import com.example.kukoo.domain.DraftField
@@ -23,8 +24,18 @@ import java.util.Locale
  */
 class RuleBasedIntentParser : IntentParser {
 
-    override suspend fun parse(utterance: String, context: ParseContext): TaskCommand =
-        context.draft?.let { parseReply(utterance, it) } ?: parseNow(utterance)
+    override suspend fun parse(utterance: String, context: ParseContext): TaskCommand {
+        context.conflict?.let { q -> ConflictReplies.read(utterance, q)?.let { return it } }
+        context.draft?.let { return parseReply(utterance, it, context.conflict) }
+        val command = parseNow(utterance)
+        // After "want me to move it?" a bare time is the new time for the task just changed.
+        if (command is TaskCommand.Unsupported && context.conflict != null) {
+            normalize(utterance).let { t -> deadlineTail(t) }?.let {
+                return TaskCommand.UpdateTask(TaskRef.Last, TaskPatch(deadline = it))
+            }
+        }
+        return command
+    }
 
     /**
      * Reads [utterance] as the answer to the question the assistant just asked about the task being
@@ -32,12 +43,20 @@ class RuleBasedIntentParser : IntentParser {
      * read for the detail that was asked for; anything that is not an answer falls through to the
      * ordinary commands, so "what's due today?" still works mid-question.
      */
-    fun parseReply(utterance: String, draft: TaskDraft): TaskCommand {
+    fun parseReply(utterance: String, draft: TaskDraft, conflict: ConflictQuestion? = null): TaskCommand {
         // A reply to "how long?" or "how important?" is a duration or a priority, never a title,
         // so every known mishearing can safely be corrected ("honor" -> "an hour").
         val t = normalize(SpeechRepair.repairAnswer(utterance))
         if (t.isEmpty()) return TaskCommand.Unsupported(utterance)
-        val expecting = draft.nextMissing()
+        // While an overlap is being settled the user is giving a new time (or length), whatever else is missing.
+        val expecting = if (conflict?.forDraft == true) DraftField.DEADLINE else draft.nextMissing()
+        // A new length ("make it 15 minutes") settles an overlap too. "in 15 minutes" is a time, not a length.
+        if (conflict?.forDraft == true && !Regex("^(?:in|at|by|around)\\b|\\d\\s*(?:am|pm)|:").containsMatchIn(t) &&
+            Regex("\\b(?:min|mins|minute|minutes|hour|hours|hr|hrs)\\b").containsMatchIn(t)
+        ) {
+            bareDuration(t.replace(Regex("^(?:(?:make|set|change) it|just|only|for|to|it takes|it will take)\\s+"), ""))
+                ?.let { return TaskCommand.FillTask(TaskDraft(durationMin = it)) }
+        }
         // "skip it" and "no" answer the reminder question; they do not cancel the task.
         if (expecting == DraftField.REMINDER) {
             reminderAnswer(t)?.let { return TaskCommand.FillTask(TaskDraft(reminderMin = it)) }
@@ -185,6 +204,14 @@ class RuleBasedIntentParser : IntentParser {
             return TaskCommand.Replan(scope)
         }
         if (replanBare.matches(t)) return TaskCommand.Replan(PlanScope.DAY)
+
+        if (conflictsAsk.matches(t)) return TaskCommand.CheckConflicts
+        findTimeAsk.matchEntire(t)?.let { m ->
+            val length = m.groupValues.drop(1).firstOrNull { it.isNotBlank() }
+            return TaskCommand.FindTime(
+                length?.let { snoozeMinutes(it) ?: snoozeMinutes(it.replace(Regex("^(?:an?|the)\\s+"), "")) }
+            )
+        }
 
         delete.matchEntire(t)?.let { return TaskCommand.DeleteTask(byTitle(it.groupValues[1])) }
 
@@ -537,6 +564,24 @@ class RuleBasedIntentParser : IntentParser {
         )
         val replanBare = Regex("(?:please )?re-?plan(?: everything| it)?")
 
+        // "any conflicts?", "do I have overlaps today", "am I double booked"
+        val conflictsAsk = Regex(
+            "(?:please )?(?:(?:do i have|are there|is there|any|check|show|list|tell me|what are|whats|what's)\\s+)?" +
+                "(?:(?:my|the|any|some|for)\\s+)*(?:conflicts?|overlaps?|clash(?:es)?|double[- ]?bookings?)" +
+                "(?: today| tomorrow| in my (?:day|schedule|calendar)| right now)?" +
+                "|(?:am i|is my (?:day|schedule|calendar)) (?:double[- ]?booked|overbooked|clashing|overlapping)"
+        )
+        // "when am I free", "next free slot", "when can I fit an hour"
+        val findTimeAsk = Regex(
+            "(?:please )?(?:when (?:am i|will i be|are we) (?:free|available)(?: for (?:an? )?(.+))?" +
+                "|when is my next (?:free|open) (?:slot|time|window)" +
+                "|(?:whats|what's) my next (?:free|open) (?:slot|time|window)" +
+                "|(?:my )?next (?:free|open) (?:slot|time|window)" +
+                "|when can i (?:fit|do|squeeze in|schedule) (?:in )?(.+?)(?: task| thing)?" +
+                "|find (?:me )?(?:some )?(?:free )?time(?: for (?:an? )?(.+))?" +
+                "|do i have (?:any )?(?:free|spare) time)"
+        )
+
         val delete = Regex("(?:please )?(?:delete|remove|cancel|drop|trash)\\s+(?:the\\s+|my\\s+)?(.+)")
         val markDone = Regex(
             "(?:please )?(?:mark|set|tick|check)\\s+(?:off\\s+)?(?:the\\s+|my\\s+)?(.+?)\\s+(?:as\\s+)?" +
@@ -557,11 +602,11 @@ class RuleBasedIntentParser : IntentParser {
         val takesDuration = Regex("(?:the\\s+|my\\s+)?(.+?)\\s+(takes|will take|needs)\\s+(.+)")
 
         val changeDeadline = Regex(
-            "(?:please )?(?:change|set|update|make)\\s+(?:the\\s+)?(?:deadline|due(?: date| time)?|time)" +
+            "(?:please )?(?:change|set|update|make)\\s+(?:the\\s+)?(?:(?:start(?:ing)? )?time|deadline|due(?: date| time)?)" +
                 "(?:\\s+(?:of|for|on)\\s+(?:the\\s+|my\\s+)?(.+?))?\\s+(?:to|as|for)\\s+(.+)"
         )
         val deadlineOfTask = Regex(
-            "(?:please )?(?:change|set|update)\\s+(?:the\\s+|my\\s+)?(.+?)\\s+(?:deadline|due date|due time)\\s+to\\s+(.+)"
+            "(?:please )?(?:change|set|update)\\s+(?:the\\s+|my\\s+)?(.+?)\\s+(?:start time|starting time|deadline|due date|due time)\\s+to\\s+(.+)"
         )
         val move = Regex(
             "(?:please )?(?:move|push|re-?schedule|postpone|shift|bump|modify|edit|adjust)\\s+" +
@@ -620,7 +665,7 @@ class RuleBasedIntentParser : IntentParser {
 
         val queryVerb = Regex("^(?:please )?(?:what|whats|what's|show|list|tell|read|give)\\b")
         val queryTopic = Regex("\\b(?:tasks?|due|plate|agenda|schedule|left|pending|to-?do|have)\\b")
-        val queryStandalone = Regex("\\b(?:due today|my tasks|my agenda|briefing|on my plate)\\b")
+        val queryStandalone = Regex("\\b(?:due today|what(?:'s|s| is) on today|scheduled today|my tasks|my agenda|briefing|on my plate)\\b")
         val allScope = Regex("\\b(?:all|everything|open|upcoming|every)\\b")
 
         // time phrases (operate on text padded with a space on both sides)

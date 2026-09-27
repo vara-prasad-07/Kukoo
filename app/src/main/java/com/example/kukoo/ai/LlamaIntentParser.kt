@@ -3,6 +3,8 @@ package com.example.kukoo.ai
 import android.content.Context
 import android.util.Log
 import com.example.kukoo.domain.ChatKind
+import com.example.kukoo.domain.ConflictQuestion
+import com.example.kukoo.domain.QuestionKind
 import com.example.kukoo.domain.DayRef
 import com.example.kukoo.domain.DeadlineSpec
 import com.example.kukoo.domain.DraftField
@@ -103,6 +105,8 @@ class LlamaIntentParser(
     private val busy = Mutex()
 
     override suspend fun parse(utterance: String, context: ParseContext): TaskCommand {
+        // "yes", "keep both", "no": the answers to an overlap question are a closed set, decided by rules.
+        context.conflict?.let { q -> ConflictReplies.read(utterance, q)?.let { return it } }
         if (!engine.ensureLoaded()) {
             Log.w(TAG, "model not loaded; asking the user to wait")
             return TaskCommand.NotReady
@@ -141,7 +145,8 @@ class LlamaIntentParser(
             context.openTaskTitles.joinToString("\n") { "- $it" }
         val system = buildString {
             append(INSTRUCTIONS)
-            context.draft?.let { append("\n\n").append(draftSection(it)) }
+            context.draft?.let { append("\n\n").append(draftSection(it, context.conflict)) }
+            context.conflict?.let { append("\n\n").append(conflictSection(it)) }
             append("\n\nOpen tasks:\n").append(titles)
             // The conversation is quoted inside the system text, not replayed as real assistant
             // turns. The assistant's replies are ordinary English ("Got it: half an hour. How
@@ -158,9 +163,9 @@ class LlamaIntentParser(
     }
 
     /** Tells the model what the assistant just asked, so a short reply is read as an answer. */
-    private fun draftSection(draft: TaskDraft): String {
+    private fun draftSection(draft: TaskDraft, conflict: ConflictQuestion? = null): String {
         fun known(value: Any?) = value?.toString()?.takeIf { it.isNotBlank() } ?: "missing"
-        val asked = when (draft.nextMissing()) {
+        val asked = if (conflict?.forDraft == true) "start time (a different one, because of the problem described below)" else when (draft.nextMissing()) {
             DraftField.TITLE, null -> "title (the task's name; put it under \"title\", never \"target\")"
             DraftField.DEADLINE -> "deadline"
             DraftField.DURATION -> "duration"
@@ -192,6 +197,29 @@ class LlamaIntentParser(
         ).joinToString("\n")
     }
 
+    /**
+     * The assistant has just raised a problem with a time and offered to fix it. Yes / no / keep both are
+     * decided by [ConflictReplies] before the model runs, so the model only has to read what is left:
+     * a new time, or a new length.
+     */
+    private fun conflictSection(q: ConflictQuestion): String = when {
+        q.forDraft && q.kind == QuestionKind.ODD_HOUR -> listOf(
+            "The assistant just asked whether the new task's start time, which is in the middle of the night, is really what they meant.",
+            "- If they give a corrected time, output {\"action\":\"answer\"} with \"time\" (and \"day\" if they said one), e.g. \"three pm\" -> {\"action\":\"answer\",\"time\":\"15:00\"}.",
+            "- If they want to drop the task, output {\"action\":\"discard_task\"}.",
+        ).joinToString("\n")
+        q.forDraft -> listOf(
+            "The assistant just told the user that the new task overlaps another task, and asked whether to use a suggested time, pick another time, or keep both.",
+            "- If they name a different day or time, output {\"action\":\"answer\"} with \"time\" (and \"day\" if they said one). A bare hour is a time here.",
+            "- If they give a different length, output {\"action\":\"answer\",\"duration_min\":N}.",
+            "- If they want to drop the task, output {\"action\":\"discard_task\"}.",
+        ).joinToString("\n")
+        else -> listOf(
+            "The assistant has just changed the task \"${q.taskTitle}\" and told the user about a problem with its time, and offered to move it.",
+            "- If they name a time to move it to, output {\"action\":\"update_task\",\"target\":\"${q.taskTitle}\"} with \"time\" (and \"day\" if they said one). A bare hour is a time here.",
+        ).joinToString("\n")
+    }
+
     /** Returns null when [raw] is not a valid, complete command (caller then falls back). */
     internal fun toCommand(raw: String, utterance: String, context: ParseContext = ParseContext()): TaskCommand? {
         val start = raw.indexOf('{')
@@ -199,6 +227,9 @@ class LlamaIntentParser(
         if (start < 0 || end <= start) return null
         val json = runCatching { JSONObject(raw.substring(start, end + 1)) }.getOrNull() ?: return null
         val pending = context.draft
+        val expecting = context.expectedField()
+        // After the assistant offered to move a task, a bare "10" is the new time.
+        val bareTime = context.conflict?.forDraft == false
 
         fun ref(): TaskRef? = when (val t = json.text("target")) {
             null -> null
@@ -211,9 +242,9 @@ class LlamaIntentParser(
             ?: json.text("kind")?.let { "chat" }
 
         return when (action) {
-            "add_task" -> newTask(json, utterance, pending)
+            "add_task" -> newTask(json, utterance, pending, expecting)
             // An answer only means something while a question is open.
-            "answer" -> pending?.let { TaskCommand.FillTask(details(json, utterance, it.nextMissing())) }
+            "answer" -> pending?.let { TaskCommand.FillTask(details(json, utterance, expecting)) }
             "discard_task" -> if (pending != null) TaskCommand.DiscardDraft else null
             "query_tasks" -> TaskCommand.QueryTasks(
                 if (json.text("scope")?.lowercase() == "all_open") QueryScope.ALL_OPEN else QueryScope.TODAY,
@@ -223,7 +254,7 @@ class LlamaIntentParser(
                 val reminder = reminder(json, utterance, expecting = null)
                 val patch = TaskPatch(
                     title = json.text("new_title")?.takeIf { Grounding.textGrounded(it, utterance) },
-                    deadline = if (clear) null else deadline(json, utterance),
+                    deadline = if (clear) null else deadline(json, utterance, bare = bareTime),
                     clearDeadline = clear,
                     durationMin = durationApartFromReminder(json, utterance, reminder),
                     reminderMin = reminder?.takeIf { it != TaskDraft.NO_REMINDER },
@@ -243,6 +274,8 @@ class LlamaIntentParser(
                 if (json.text("scope")?.lowercase() == "afternoon") PlanScope.AFTERNOON else PlanScope.DAY,
             )
             "undo" -> TaskCommand.Undo
+            "check_conflicts" -> TaskCommand.CheckConflicts
+            "find_time" -> TaskCommand.FindTime(duration(json, utterance))
             "snooze" -> TaskCommand.Snooze(duration(json, utterance) ?: 15)
             "end_call" -> TaskCommand.EndCall
             "ask_what_to_change" -> ref()?.let { TaskCommand.AskWhatToChange(it) }
@@ -260,8 +293,8 @@ class LlamaIntentParser(
      * "Add …": a named task is an [TaskCommand.AddTask] and an unnamed one a [TaskCommand.StartTask],
      * matching what the rule parser produces. Mid-question, details without a name are the answer.
      */
-    private fun newTask(json: JSONObject, utterance: String, pending: TaskDraft?): TaskCommand {
-        val d = details(json, utterance, pending?.nextMissing())
+    private fun newTask(json: JSONObject, utterance: String, pending: TaskDraft?, expecting: DraftField?): TaskCommand {
+        val d = details(json, utterance, expecting)
         val title = d.title
         return when {
             // A reminder of NO_REMINDER (0) is "no reminder call"; the engine's draft keeps it distinct from "not asked yet".
@@ -389,7 +422,7 @@ class LlamaIntentParser(
             You turn one spoken sentence about a to-do list into ONE JSON object. Output the JSON only.
 
             Keys. Leave out every key the user did not clearly say. Never guess, invent or fill in a default.
-            "action": add_task, answer, discard_task, query_tasks, update_task, complete_task, reopen_task, delete_task, replan, undo, snooze, end_call, ask_what_to_change, chat, unsupported
+            "action": add_task, answer, discard_task, query_tasks, update_task, complete_task, reopen_task, delete_task, replan, undo, snooze, end_call, ask_what_to_change, check_conflicts, find_time, chat, unsupported
             "title": the task's name, in the user's own words
             "day": today, tomorrow, or monday..sunday
             "time": "HH:mm" 24-hour. A bare hour from 1 to 7 means pm.
@@ -414,6 +447,8 @@ class LlamaIntentParser(
             - "reminder_min" is only for a call before the deadline ("remind me 10 minutes before", "call me half an hour ahead" -> 30). It is never the length of the task: put that under "duration_min". Only say 0 when they clearly want no reminder.
             - Adding, changing or removing the reminder call of an existing task is update_task with "target" and "reminder_min" (0 removes it).
             - ask_what_to_change: they named a task to change but not what to change about it.
+            - check_conflicts: they ask whether any tasks overlap or clash ("any conflicts?", "am I double booked?").
+            - find_time: they ask when they are free ("when am I free?", "when can I fit an hour?"). Include "duration_min" only if they named a length.
             - chat: a greeting, a thank-you, a bare acknowledgement ("okay", "yeah"), or asking what you can do. It looks like {"action":"chat","kind":"thanks"} — always include "action".
             - Use unsupported only when nothing else fits.
         """.trimIndent()

@@ -125,7 +125,7 @@ class AppFlowTest {
             LocalDate.now(clock).plusDays(1),
             Instant.ofEpochMilli(deck.deadline!!).atZone(clock.zone).toLocalDate()
         )
-        assertTrue(vm.state.value.session.turns.last().text.startsWith("Done. Client Deck is now due tomorrow at "))
+        assertTrue(vm.state.value.session.turns.last().text.startsWith("Done. Client Deck now starts tomorrow at "))
 
         vm.say("Mark the follow-up as done", "Done. I marked Follow-up as done.")
         assertEquals(TaskStatus.DONE, vm.task("Follow-up").status)
@@ -137,6 +137,13 @@ class AppFlowTest {
         vm.say("Add a task: finish the report tomorrow at 5")
         assertTrue(vm.state.value.tasks.none { it.title == "Finish the report" })
         vm.say("45 minutes")
+        // 5 PM tomorrow runs into the Client Deck that was just moved to 5:20 PM, so the assistant asks
+        // about it before saving anything, and "keep both" is understood as the answer.
+        val question = vm.state.value.session.turns.last().text
+        assertTrue(question, question.contains("would overlap Client Deck"))
+        assertTrue(question, question.endsWith("Should I use that, pick another time, or keep both?"))
+        assertTrue(vm.state.value.tasks.none { it.title == "Finish the report" })
+        vm.say("keep both")
         vm.say("high")
         vm.say("no reminder")
         assertNotNull(vm.task("Finish the report").deadline)
@@ -210,8 +217,8 @@ class AppFlowTest {
         vm.say("add a task", "What should I call the task?")
         assertEquals(before, vm.state.value.tasks.size)
 
-        vm.say("call mom", "Got it: Call mom. When is Call mom due?")
-        vm.say("tomorrow at 6", "Got it: due tomorrow at 6 PM. How long will Call mom take?")
+        vm.say("call mom", "Got it: Call mom. When should Call mom start?")
+        vm.say("tomorrow at 6", "Got it: starts tomorrow at 6 PM. How long will Call mom take?")
         assertEquals(before, vm.state.value.tasks.size)
 
         // Something that is not an answer gets the same question again, not a guess.

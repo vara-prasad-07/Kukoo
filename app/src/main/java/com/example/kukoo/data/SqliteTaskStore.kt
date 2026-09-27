@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import com.example.kukoo.domain.OverlapAck
 import com.example.kukoo.domain.Priority
 import com.example.kukoo.domain.Recurrence
 import com.example.kukoo.domain.Task
@@ -33,6 +34,15 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
             """.trimIndent()
         )
         db.execSQL("CREATE INDEX idx_tasks_deadline ON $TABLE($DEADLINE)")
+        createAckTable(db)
+    }
+
+    private fun createAckTable(db: SQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS $ACKS (a_id INTEGER NOT NULL, a_start INTEGER NOT NULL, a_min INTEGER NOT NULL, " +
+                "b_id INTEGER NOT NULL, b_start INTEGER NOT NULL, b_min INTEGER NOT NULL, " +
+                "PRIMARY KEY (a_id, a_start, a_min, b_id, b_start, b_min))"
+        )
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -44,6 +54,7 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
         if (oldVersion < 3) {
             db.execSQL("ALTER TABLE $TABLE ADD COLUMN $REMINDER INTEGER")
         }
+        if (oldVersion < 4) createAckTable(db)
     }
 
     override fun all(): List<Task> {
@@ -69,11 +80,38 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
         check(rows == 1) { "Task ${task.id} does not exist" }
     }
 
-    override fun delete(id: Long): Boolean =
-        writableDatabase.delete(TABLE, "$ID = ?", arrayOf(id.toString())) > 0
+    override fun delete(id: Long): Boolean {
+        val gone = writableDatabase.delete(TABLE, "$ID = ?", arrayOf(id.toString())) > 0
+        writableDatabase.delete(ACKS, "a_id = ? OR b_id = ?", arrayOf(id.toString(), id.toString()))
+        return gone
+    }
 
     override fun deleteAll() {
         writableDatabase.delete(TABLE, null, null)
+        writableDatabase.delete(ACKS, null, null)
+    }
+
+    override fun acks(): Set<OverlapAck> {
+        val out = mutableSetOf<OverlapAck>()
+        readableDatabase.query(ACKS, null, null, null, null, null, null).use { c ->
+            while (c.moveToNext()) {
+                out += OverlapAck(
+                    c.getLong(0), c.getLong(1), c.getInt(2), c.getLong(3), c.getLong(4), c.getInt(5)
+                )
+            }
+        }
+        return out
+    }
+
+    override fun addAck(ack: OverlapAck) {
+        writableDatabase.insertWithOnConflict(
+            ACKS, null,
+            ContentValues().apply {
+                put("a_id", ack.aId); put("a_start", ack.aStart); put("a_min", ack.aMin)
+                put("b_id", ack.bId); put("b_start", ack.bStart); put("b_min", ack.bMin)
+            },
+            SQLiteDatabase.CONFLICT_IGNORE
+        )
     }
 
     private fun Task.toValues() = ContentValues().apply {
@@ -109,8 +147,9 @@ class SqliteTaskStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, nul
 
     private companion object {
         const val DB_NAME = "kukoo.db"
-        const val DB_VERSION = 3
+        const val DB_VERSION = 4
         const val TABLE = "tasks"
+        const val ACKS = "overlap_acks"
         const val ID = "id"
         const val TITLE = "title"
         const val DEADLINE = "deadline_at"

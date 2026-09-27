@@ -15,7 +15,7 @@ object LlamaGrammar {
 root ::= "{" ws "\"action\"" ws ":" ws body ws "}"
 
 body ::= addbody | answerbody | querybody | updatebody | targetbody | replanbody | snoozebody
-       | chatbody | simplebody
+       | chatbody | findbody | simplebody
 
 # A new task: whatever details the user gave, and never a target (it does not exist yet).
 addbody    ::= "\"add_task\"" (ws "," ws detail)*
@@ -36,8 +36,9 @@ targetbody ::= ("\"complete_task\"" | "\"reopen_task\"" | "\"delete_task\"" | "\
 querybody  ::= "\"query_tasks\"" (ws "," ws "\"scope\"" ws ":" ws ("\"today\"" | "\"all_open\""))?
 replanbody ::= "\"replan\"" (ws "," ws "\"scope\"" ws ":" ws ("\"afternoon\"" | "\"day\""))?
 snoozebody ::= "\"snooze\"" (ws "," ws duration)?
+findbody   ::= "\"find_time\"" (ws "," ws duration)?
 chatbody   ::= "\"chat\"" ws "," ws chatkind
-simplebody ::= "\"discard_task\"" | "\"undo\"" | "\"end_call\"" | "\"unsupported\""
+simplebody ::= "\"discard_task\"" | "\"undo\"" | "\"end_call\"" | "\"check_conflicts\"" | "\"unsupported\""
 
 title      ::= "\"title\"" ws ":" ws string
 target     ::= "\"target\"" ws ":" ws string

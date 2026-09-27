@@ -2,6 +2,7 @@ package com.example.kukoo.ai
 
 import com.example.kukoo.domain.ConflictQuestion
 import com.example.kukoo.domain.DraftField
+import com.example.kukoo.domain.PlanningState
 import com.example.kukoo.domain.TaskCommand
 import com.example.kukoo.domain.TaskDraft
 
@@ -10,7 +11,8 @@ import com.example.kukoo.domain.TaskDraft
  *
  * [draft] is set while the assistant is in the middle of adding a task and has just asked for a
  * missing detail: the next utterance is then most likely the answer ("an hour", "high"), not a
- * fresh command.
+ * fresh command. [planning] plays the same part while a day is being planned: the next utterance is
+ * then the task list, a yes, or a change to the proposal.
  */
 data class ParseContext(
     val openTaskTitles: List<String> = emptyList(),
@@ -24,7 +26,8 @@ data class ParseContext(
      * Set while the assistant is waiting for an answer about an overlap (or an odd start time): the
      * next utterance is then "yes", "keep both", a new time or a new length, not a fresh command.
      */
-    val conflict: ConflictQuestion? = null
+    val conflict: ConflictQuestion? = null,
+    val planning: PlanningState? = null
 ) {
     /**
      * The detail a short reply is most likely giving. While a conflict is being settled that is a new

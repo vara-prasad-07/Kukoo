@@ -15,7 +15,7 @@ object LlamaGrammar {
 root ::= "{" ws "\"action\"" ws ":" ws body ws "}"
 
 body ::= addbody | answerbody | querybody | updatebody | targetbody | replanbody | snoozebody
-       | chatbody | findbody | simplebody
+       | chatbody | findbody | planbody | plantasksbody | planchangebody | simplebody
 
 # A new task: whatever details the user gave, and never a target (it does not exist yet).
 addbody    ::= "\"add_task\"" (ws "," ws detail)*
@@ -38,7 +38,15 @@ replanbody ::= "\"replan\"" (ws "," ws "\"scope\"" ws ":" ws ("\"afternoon\"" | 
 snoozebody ::= "\"snooze\"" (ws "," ws duration)?
 findbody   ::= "\"find_time\"" (ws "," ws duration)?
 chatbody   ::= "\"chat\"" ws "," ws chatkind
-simplebody ::= "\"discard_task\"" | "\"undo\"" | "\"end_call\"" | "\"check_conflicts\"" | "\"unsupported\""
+simplebody ::= "\"discard_task\"" | "\"undo\"" | "\"end_call\"" | "\"check_conflicts\"" | "\"unsupported\"" | "\"approve_plan\""
+
+# Planning a day: a day or date, and the tasks the user listed, each as its own small object.
+planbody       ::= "\"plan_day\"" (ws "," ws (day | date))? (ws "," ws tasks)?
+plantasksbody  ::= "\"plan_tasks\"" ws "," ws tasks
+planchangebody ::= "\"plan_change\"" (ws "," ws pchange)*
+pchange        ::= target | day | date | time | duration | priority | remove
+tasks          ::= "\"tasks\"" ws ":" ws "[" ws taskobj (ws "," ws taskobj)* ws "]"
+taskobj        ::= "{" ws title (ws "," ws (duration | priority | time))* ws "}"
 
 title      ::= "\"title\"" ws ":" ws string
 target     ::= "\"target\"" ws ":" ws string
@@ -48,6 +56,8 @@ day        ::= "\"day\"" ws ":" ws ("\"today\"" | "\"tomorrow\"" | "\"monday\"" 
                                  | "\"thursday\"" | "\"friday\"" | "\"saturday\"" | "\"sunday\"")
 time       ::= "\"time\"" ws ":" ws "\"" ([01] [0-9] | "2" [0-3]) ":" [0-5] [0-9] "\""
 clear      ::= "\"clear_deadline\"" ws ":" ws ("true" | "false")
+remove     ::= "\"remove\"" ws ":" ws ("true" | "false")
+date       ::= "\"date\"" ws ":" ws "\"" [0-9] [0-9] [0-9] [0-9] "-" ("0" [1-9] | "1" [0-2]) "-" ("0" [1-9] | [12] [0-9] | "3" [01]) "\""
 duration   ::= "\"duration_min\"" ws ":" ws [1-9] [0-9]? [0-9]? [0-9]?
 reminder   ::= "\"reminder_min\"" ws ":" ws ("0" | [1-9] [0-9]? [0-9]? [0-9]?)
 priority   ::= "\"priority\"" ws ":" ws ("\"high\"" | "\"medium\"" | "\"low\"")

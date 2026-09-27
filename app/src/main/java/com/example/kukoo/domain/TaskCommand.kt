@@ -2,6 +2,7 @@ package com.example.kukoo.domain
 
 import java.time.DayOfWeek
 import java.time.LocalTime
+import java.time.MonthDay
 
 /** A calendar day named relative to "today", resolved deterministically by [DeadlineResolver]. */
 sealed interface DayRef {
@@ -147,6 +148,37 @@ sealed interface TaskCommand {
      */
     data class Chat(val kind: ChatKind) : TaskCommand
 
+    /**
+     * "Plan my day" (optionally "for tomorrow" / "for Friday" / "for October 5th"). Opens the planning
+     * conversation; [items] are the tasks the user already listed in the same breath, if any.
+     */
+    data class PlanDay(
+        val day: DayRef? = null,
+        val date: MonthDay? = null,
+        val items: List<PlanItemSpec> = emptyList()
+    ) : TaskCommand
+
+    /** More tasks for the plan being made ("also add cooking"). */
+    data class PlanAdd(val items: List<PlanItemSpec>) : TaskCommand
+
+    /**
+     * A change to the plan being reviewed. With a [target] it edits (or, with [remove], drops) that one task;
+     * without one it changes the plan itself: a later start ([at]) or another day ([day] / [date]). With
+     * nothing at all it means "not like this" and the assistant asks what to change.
+     */
+    data class PlanChange(
+        val target: String? = null,
+        val at: LocalTime? = null,
+        val durationMin: Int? = null,
+        val priority: Priority? = null,
+        val remove: Boolean = false,
+        val day: DayRef? = null,
+        val date: MonthDay? = null
+    ) : TaskCommand
+
+    /** "Yes, add it": the proposed plan becomes real tasks. */
+    data object PlanApprove : TaskCommand
+
     /** Reverts the most recent change made by add / update / complete / reopen / delete. */
     data object Undo : TaskCommand
 
@@ -186,7 +218,9 @@ data class EngineResult(
     val outcome: Outcome,
     val spoken: String,
     val taskIds: List<Long> = emptyList(),
-    val plan: Plan? = null
+    val plan: Plan? = null,
+    /** True when this reply wrote to the task list, whatever command it answered (so Undo can be offered). */
+    val changedTasks: Boolean = false
 ) {
     val isSuccess: Boolean get() = outcome == Outcome.OK
 }

@@ -24,7 +24,7 @@ internal object Grounding {
     private val notATitle = setOf(
         "a", "an", "the", "new", "task", "tasks", "todo", "to", "do", "reminder", "item", "thing", "something",
         "one", "it", "this", "that", "add", "create", "make", "please", "yes", "no", "yeah", "yep", "nope", "okay",
-        "ok", "sure", "um", "uh", "hmm", "what"
+        "ok", "sure", "um", "uh", "hmm", "what", "them", "these", "those", "all", "everything"
     )
 
     /** True for text that names no task at all, e.g. "task", "a new task", "yes". */
@@ -130,6 +130,63 @@ internal object Grounding {
     )
 
     fun priorityGrounded(utterance: String): Boolean = priorityWord.containsMatchIn(utterance.lowercase(Locale.ROOT))
+
+    private val planWord = Regex("\\b(?:plan\\w*|schedul\\w*|organi[sz]\\w*|arrang\\w*|agenda|timetable|itinerary|routine)\\b")
+
+    /** "Plan my day" needs the user to have said something about planning. */
+    fun planGrounded(utterance: String): Boolean = planWord.containsMatchIn(utterance.lowercase(Locale.ROOT))
+
+    private val planFiller = setOf(
+        "plan", "planning", "my", "day", "days", "today", "tomorrow", "tmr", "tmrw", "schedule", "agenda", "for", "and", "i", "have"
+    )
+
+    /** True for a "task" that is really the request itself ("my day", "plan"), not something to schedule. */
+    fun isPlanFiller(text: String): Boolean = tokens(text).all { it in notATitle || it in planFiller }
+
+    private val approveWord = Regex(
+        "\\b(?:yes|yeah|yep|yup|yea|sure|okay|ok|alright|fine|good|great|perfect|correct|right|confirm|approve|proceed|" +
+            "continue|sounds|looks|works)\\b|\\bgo (?:ahead|on)\\b|\\bdo it\\b|\\badd (?:them|it|all|these|those)\\b|" +
+            "\\bthat(?:'?s| is) (?:all|it)\\b|\\bnothing else\\b|\\bno more\\b|\\bjust (?:those|these|that|plan)\\b|" +
+            "\\ball good\\b|\\bplease do\\b"
+    )
+    private val changeWord = Regex(
+        "\\b(?:but|except|instead|change|move|make|remove|drop|shorter|longer|earlier|later|swap|replace|not|rather|also|too)\\b"
+    )
+
+    /** A yes to a proposal: an agreeing word, and nothing in the same breath that asks for a change. */
+    fun approvalGrounded(utterance: String): Boolean {
+        val u = utterance.lowercase(Locale.ROOT)
+        return approveWord.containsMatchIn(u) && !changeWord.containsMatchIn(u)
+    }
+
+    private val dropTaskWord = Regex(
+        "\\b(?:remove|drop|delete|skip|cancel|scrap|forget|without|get rid|no need|not needed)\\b|" +
+            "\\b(?:leave|take|cut) (?:it |that |them )?out\\b|\\bdon'?t need\\b"
+    )
+
+    fun removeGrounded(utterance: String): Boolean = dropTaskWord.containsMatchIn(utterance.lowercase(Locale.ROOT))
+
+    /** How many separate priority words, clock times the user gave, so one answer cannot be copied onto every task. */
+    fun priorityWordCount(utterance: String): Int = priorityWord.findAll(utterance.lowercase(Locale.ROOT)).count()
+
+    fun timeMarkerCount(utterance: String): Int = timeMarker.findAll(utterance.lowercase(Locale.ROOT)).count()
+
+    private val monthNames = listOf(
+        "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"
+    )
+
+    /**
+     * A calendar date needs both its month ("october" or "oct") and its day number ("5", "5th") in the user's words.
+     * The model gets the year wrong as often as not, so only the month and day are ever taken from it.
+     */
+    fun monthDayGrounded(month: Int, day: Int, utterance: String): Boolean {
+        if (month !in 1..12) return false
+        val u = utterance.lowercase(Locale.ROOT)
+        val full = monthNames[month - 1]
+        val names = listOf(full, full.take(3)) + if (month == 9) listOf("sept") else emptyList()
+        val monthSaid = names.any { Regex("\\b$it\\b").containsMatchIn(u) }
+        return monthSaid && Regex("\\b$day(?:st|nd|rd|th)?\\b").containsMatchIn(u)
+    }
 
     private val repeatWord = Regex(
         "\\b(?:daily|every|each|everyday|weekdays?|weekly|monthly|repeat\\w*|recurr\\w*|annually)\\b"

@@ -655,7 +655,7 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
                     .map { ConversationTurn(it.fromUser, it.text) }
                 val parsed = container.parser.parse(
                     text,
-                    ParseContext(openTitles, engine.pendingDraft, recent, engine.pendingConflict),
+                    ParseContext(openTitles, engine.pendingDraft, recent, engine.pendingConflict, engine.pendingPlan),
                 )
                 command = parsed
                 engine.executeSpoken(parsed).also { result ->
@@ -750,7 +750,11 @@ class KukooViewModel(application: Application) : AndroidViewModel(application) {
                 _state.update { it.copy(canUndo = true) }
                 _events.tryEmit(UiEvent.ShowUndoSnackbar(result.spoken))
             }
-            else -> Unit
+            // Approving a day plan writes several tasks; a plain "okay" can approve it too, whatever the command was.
+            else -> if (result.changedTasks) {
+                _state.update { it.copy(canUndo = true) }
+                _events.tryEmit(UiEvent.ShowUndoSnackbar(result.spoken))
+            }
         }
     }
 

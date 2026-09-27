@@ -39,6 +39,26 @@ class DeadlineResolver(private val clock: Clock, private val config: PlannerConf
         }
     }
 
+    /**
+     * The calendar day a plan is for. A named [day] is resolved like a deadline's; a [monthDay] ("October 5th")
+     * is its next occurrence, today included. With neither, today.
+     */
+    fun dateOf(day: DayRef?, monthDay: java.time.MonthDay?): LocalDate {
+        val today = today()
+        if (monthDay != null) {
+            val thisYear = monthDay.atYear(today.year)
+            return if (thisYear.isBefore(today)) monthDay.atYear(today.year + 1) else thisYear
+        }
+        return when (day) {
+            null, DayRef.Today -> today
+            DayRef.Tomorrow -> today.plusDays(1)
+            is DayRef.Weekday -> nextWeekday(day.day)
+        }
+    }
+
+    /** [time] on [date] in the device's zone. */
+    fun at(date: LocalDate, time: LocalTime): Long = LocalDateTime.of(date, time).atZone(zone).toInstant().toEpochMilli()
+
     /** The next due time after [deadline] for a repeating task: same time of day, later date. */
     fun nextOccurrence(deadline: Long, recurrence: Recurrence): Long {
         val current = toLocal(deadline)

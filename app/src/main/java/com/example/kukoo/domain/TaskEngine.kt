@@ -4,6 +4,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.time.Clock
+import java.time.LocalDate
+import java.time.LocalTime
 
 /**
  * The single place where task state changes. Voice, typed input and the UI forms all go
@@ -62,11 +64,25 @@ class TaskEngine(
             }
         }
 
+    /** The day being planned by conversation, or null. Only ever changed while holding [mutex]. */
+    @Volatile
+    private var dayPlan: PlanSession? = null
+
+    private val dayPlanner = DayPlanner(clock, config)
+
+    /** Where the planning conversation stands, so a parser can read "yes" or "make it shorter" correctly. */
+    val pendingPlan: PlanningState?
+        get() = dayPlan?.let { s ->
+            val titles = s.proposal?.let { p -> (p.placed + p.unplaced).map { it.title } } ?: s.items.map { it.title }
+            PlanningState(s.stage, format.day(s.date), titles)
+        }
+
     fun resetContext() {
         lastTaskId = null
         undoAction = null
         draft = null
         offer = null
+        dayPlan = null
     }
 
     fun tasks(): List<Task> = store.all()
@@ -105,6 +121,10 @@ class TaskEngine(
         TaskCommand.CheckConflicts -> checkConflicts()
         is TaskCommand.FindTime -> findTime(command.durationMin)
         is TaskCommand.Resolve -> resolve(command.choice, null)
+        is TaskCommand.PlanDay -> startPlan(command)
+        is TaskCommand.PlanAdd -> planAdd(command)
+        is TaskCommand.PlanChange -> planChange(command)
+        TaskCommand.PlanApprove -> approvePlan()
         TaskCommand.Undo -> undo()
         is TaskCommand.Snooze -> snooze(command.minutes)
         TaskCommand.EndCall -> EngineResult(Outcome.END_CALL, "Okay, goodbye. Your tasks are up to date.")
@@ -135,6 +155,9 @@ class TaskEngine(
 
     private fun chat(kind: ChatKind): EngineResult {
         val pending = draft
+        val planning = dayPlan
+        // "Okay" / "yeah" after a proposal is the yes it was waiting for.
+        if (planning?.proposal != null && kind == ChatKind.ACKNOWLEDGE) return approvePlan()
         val message = when (kind) {
             ChatKind.GREETING -> "${format.greeting()}. What would you like to do?"
             ChatKind.THANKS -> "You're welcome."
@@ -143,6 +166,9 @@ class TaskEngine(
         }
         // Mid-dialog the question still needs answering, so repeat it after the pleasantry.
         if (pending != null && kind != ChatKind.HELP) return ask(pending, prefix = "$message ")
+        if (planning != null && kind != ChatKind.HELP) {
+            return EngineResult(Outcome.NEEDS_INFO, "$message ${planQuestion(planning)}")
+        }
         val tail = when (kind) {
             ChatKind.THANKS, ChatKind.ACKNOWLEDGE -> " Anything else?"
             else -> ""
@@ -152,6 +178,7 @@ class TaskEngine(
 
     private suspend fun dispatchSpoken(command: TaskCommand): EngineResult {
         val pending = draft
+        val planning = dayPlan
         // A question about an overlap is only good for the very next thing the user says.
         val standing = offer
         offer = null
@@ -166,20 +193,34 @@ class TaskEngine(
             TaskCommand.DiscardDraft ->
                 if (pending == null && standing != null) resolve(ConflictChoice.KEEP, standing) else dispatch(command)
             is TaskCommand.Snooze, is TaskCommand.ReopenTask -> withNewOverlaps(command)
-            is TaskCommand.AddTask -> startDraft(TaskDraft.of(command))
+            // While a day is being planned, "add cooking" means add it to the plan, not start a second dialog.
+            is TaskCommand.AddTask ->
+                if (planning != null) planAdd(TaskCommand.PlanAdd(listOf(planItemOf(command))))
+                else startDraft(TaskDraft.of(command))
             // A misheard "gym every day at 12pm" is still a new task, and needs the same questions.
             is TaskCommand.UpdateTask ->
-                selfHealToAdd(command)?.let { startDraft(TaskDraft.of(it)) } ?: withDraftReminder(command)
+                planEditFrom(command)?.let { dispatch(it) }
+                    ?: (if (planning == null) selfHealToAdd(command) else null)?.let { startDraft(TaskDraft.of(it)) }
+                    ?: withDraftReminder(command)
+            is TaskCommand.DeleteTask -> planDropFrom(command)?.let { dispatch(it) } ?: withDraftReminder(command)
+            is TaskCommand.StartTask, is TaskCommand.FillTask ->
+                if (planning != null) EngineResult(Outcome.NEEDS_INFO, "Sure. ${planQuestion(planning)}") else dispatch(command)
             // chat() re-asks the pending question itself, so it must not also get a draft reminder.
-            is TaskCommand.StartTask, is TaskCommand.FillTask -> dispatch(command)
-            is TaskCommand.Unsupported ->
-                if (pending != null) ask(pending, prefix = "Sorry, I didn't catch that. ") else dispatch(command)
+            is TaskCommand.PlanDay, is TaskCommand.PlanAdd, is TaskCommand.PlanChange, TaskCommand.PlanApprove ->
+                dispatch(command)
+            is TaskCommand.Unsupported -> when {
+                pending != null -> ask(pending, prefix = "Sorry, I didn't catch that. ")
+                planning != null -> EngineResult(Outcome.NEEDS_INFO, "Sorry, I didn't catch that. ${planQuestion(planning)}")
+                else -> dispatch(command)
+            }
             TaskCommand.EndCall -> {
-                if (pending == null) return dispatch(command)
+                if (pending == null && planning == null) return dispatch(command)
                 draft = null
+                dayPlan = null
                 EngineResult(
                     Outcome.END_CALL,
-                    "Okay, goodbye. I didn't add ${pending.title ?: "the new task"} because it wasn't finished."
+                    if (pending != null) "Okay, goodbye. I didn't add ${pending.title ?: "the new task"} because it wasn't finished."
+                    else "Okay, goodbye. I didn't add the plan because it wasn't approved."
                 )
             }
             else -> withDraftReminder(command)
@@ -534,13 +575,26 @@ class TaskEngine(
     /** Appended to the answer of an unrelated command so the user is brought back to the open question. */
     private suspend fun withDraftReminder(command: TaskCommand): EngineResult {
         val pending = draft
+        val planning = dayPlan
         val result = dispatch(command)
-        if (pending == null) return result
-        val lead = pending.title?.let { "Back to $it." } ?: "Back to the new task."
-        return result.copy(spoken = "${result.spoken} $lead ${question(pending)}")
+        if (pending != null) {
+            val lead = pending.title?.let { "Back to $it." } ?: "Back to the new task."
+            return result.copy(spoken = "${result.spoken} $lead ${question(pending)}")
+        }
+        // The command may itself have ended the plan, so only one that is still open needs the reminder.
+        val open = dayPlan
+        if (planning != null && open != null) {
+            return result.copy(spoken = "${result.spoken} Back to planning ${format.day(open.date)}. ${planQuestion(open)}")
+        }
+        return result
     }
 
     private fun discardDraft(): EngineResult {
+        val planning = dayPlan
+        if (draft == null && planning != null) {
+            dayPlan = null
+            return EngineResult(Outcome.OK, "Okay, I've dropped the plan for ${format.day(planning.date)}. Nothing was added.")
+        }
         val pending = draft ?: return reject("There is no new task to cancel.")
         draft = null
         return EngineResult(Outcome.OK, "Okay, I won't add ${pending.title ?: "the new task"}.")
@@ -795,7 +849,540 @@ class TaskEngine(
         return EngineResult(Outcome.OK, "Done. I deleted ${task.title}.", taskIds = listOf(task.id))
     }
 
-    // ---- the day plan ----------------------------------------------------------------------
+    // ---- planning a day by conversation --------------------------------------------------
+
+    /**
+     * A day being planned. [items] are the tasks the user named (the planner picks their slots); [proposal] is
+     * the plan last shown, and while it is null the assistant is still waiting to hear the task list.
+     */
+    private data class PlanSession(
+        val date: LocalDate,
+        val items: List<PlanItemSpec> = emptyList(),
+        /** Tasks already on the list that the user asked to leave out of this plan. */
+        val skipped: Set<Long> = emptySet(),
+        /** Tasks already on the list that are not due that day but were named, so they are planned anyway. */
+        val pulled: Set<Long> = emptySet(),
+        val startAt: LocalTime? = null,
+        val proposal: DayProposal? = null
+    ) {
+        val stage: PlanStage get() = if (proposal == null) PlanStage.ASK_TASKS else PlanStage.REVIEW
+    }
+
+    private class AbsorbedPlan(val session: PlanSession, val added: List<String>, val problems: List<String>) {
+        fun madeProgress(before: PlanSession) =
+            added.isNotEmpty() || session.pulled != before.pulled || session.skipped != before.skipped
+    }
+
+    private class Built(val session: PlanSession, val problems: List<String>)
+
+    private sealed interface ItemMatch {
+        data class One(val title: String, val existingId: Long?) : ItemMatch
+        data class Many(val titles: List<String>) : ItemMatch
+        data object None : ItemMatch
+    }
+
+    /** "Plan my day": opens the conversation, or goes straight to a proposal when the tasks came with it. */
+    private fun startPlan(cmd: TaskCommand.PlanDay): EngineResult {
+        // "Plan for Friday instead" said mid-plan changes the plan; it must not start over and lose the list.
+        val current = dayPlan
+        if (current != null && cmd.items.isEmpty() && current.items.isNotEmpty()) {
+            return if (cmd.day == null && cmd.date == null) {
+                proposeAndAsk(current, "We're already planning ${format.day(current.date)}. ")
+            } else {
+                planChange(TaskCommand.PlanChange(day = cmd.day, date = cmd.date))
+            }
+        }
+        val lead = StringBuilder()
+        val unfinished = draft
+        if (unfinished != null) {
+            draft = null
+            lead.append("Dropping the unfinished ${unfinished.title ?: "new task"}. ")
+        } else if (dayPlan?.items?.isNotEmpty() == true) {
+            lead.append("Starting a fresh plan. ")
+        }
+
+        val today = resolver.today()
+        var date = resolver.dateOf(cmd.day, cmd.date)
+        if (date == today && tooLateToday()) {
+            date = today.plusDays(1)
+            lead.append("It's too late to plan what's left of today, so I'll plan tomorrow. ")
+        }
+
+        val base = PlanSession(date)
+        val absorbed = absorbItems(base, cmd.items)
+        val session = absorbed.session
+        absorbed.problems.forEach { lead.append(it).append(' ') }
+
+        val gaveTasks = cmd.items.isNotEmpty()
+        if (gaveTasks && (session.items.isNotEmpty() || existingFor(session).isNotEmpty())) {
+            if (absorbed.added.isNotEmpty()) lead.append("Got it: ${naturalJoin(absorbed.added.distinct())}. ")
+            return proposeAndAsk(session, lead.toString())
+        }
+
+        dayPlan = session
+        val day = format.day(date)
+        val existing = existingFor(session)
+        val sorry = if (gaveTasks && absorbed.problems.isEmpty()) "Sorry, I didn't catch those tasks. " else ""
+        val ask = if (existing.isEmpty()) {
+            "Sure, let's plan $day. What's on your mind? Tell me the tasks you want to fit in, " +
+                "and I'll suggest the best order and timing."
+        } else {
+            "Sure, let's plan $day. You already have ${listTitles(existing)} on your list for then, so I'll fit " +
+                "${if (existing.size == 1) "that" else "those"} in too. What else is on your mind? " +
+                "Tell me the tasks, or say that's all."
+        }
+        return EngineResult(Outcome.NEEDS_INFO, "$lead$sorry$ask")
+    }
+
+    /** More tasks for the plan. With no plan open it starts one. */
+    private fun planAdd(cmd: TaskCommand.PlanAdd): EngineResult {
+        val open = dayPlan ?: return startPlan(TaskCommand.PlanDay(items = cmd.items))
+        val absorbed = absorbItems(open, cmd.items)
+        val problems = absorbed.problems.joinToString("") { "$it " }
+        if (!absorbed.madeProgress(open)) {
+            val sorry = if (absorbed.problems.isEmpty()) "Sorry, I didn't catch any tasks. " else ""
+            return EngineResult(Outcome.NEEDS_INFO, "$sorry$problems${planQuestion(open)}")
+        }
+        val heard = if (absorbed.added.isEmpty()) "" else "Got it: ${naturalJoin(absorbed.added.distinct())}. "
+        return proposeAndAsk(absorbed.session, problems + heard)
+    }
+
+    /** A change to the plan under review: one task's time, length or priority, dropping it, or the plan itself. */
+    private fun planChange(cmd: TaskCommand.PlanChange): EngineResult {
+        val open = dayPlan ?: return reject("There is no plan in progress. Say plan my day to start one.")
+        val nothingSaid = cmd.target == null && cmd.at == null && cmd.durationMin == null && cmd.priority == null &&
+            !cmd.remove && cmd.day == null && cmd.date == null
+        if (nothingSaid) {
+            return EngineResult(
+                Outcome.NEEDS_INFO,
+                "Sure, what should I change? You can move a task, change how long it takes or how important it is, " +
+                    "add or remove one, or say cancel to drop the plan."
+            )
+        }
+
+        var s = open
+        val said = mutableListOf<String>()
+        val problems = mutableListOf<String>()
+
+        // The plan itself: another day, or a later start.
+        if (cmd.day != null || cmd.date != null) {
+            val date = resolver.dateOf(cmd.day, cmd.date)
+            when {
+                date == s.date -> Unit
+                date == resolver.today() && tooLateToday() -> problems += "It's too late to plan what's left of today."
+                else -> {
+                    s = s.copy(date = date, skipped = emptySet(), pulled = emptySet())
+                    said += "Planning ${format.day(date)} instead."
+                }
+            }
+        }
+        val startAt = cmd.at
+        if (cmd.target == null && startAt != null) {
+            if (startAt.hour >= config.dayEndHour) {
+                problems += "That's too late in the day to start."
+            } else {
+                s = s.copy(startAt = startAt)
+                said += "Starting from ${format.clockTime(startAt)}."
+            }
+        }
+        if (cmd.target == null && (cmd.durationMin != null || cmd.priority != null || cmd.remove)) {
+            problems += "I wasn't sure which task you meant. ${planTitlesSentence(s)}"
+        }
+
+        // One task in the plan.
+        val target = cmd.target
+        if (target != null) {
+            val one = when (val m = matchPlanItem(s, target)) {
+                is ItemMatch.One -> m
+                is ItemMatch.Many -> return EngineResult(
+                    Outcome.NEEDS_CLARIFICATION,
+                    "I found ${m.titles.size} matching tasks in the plan: ${naturalJoin(m.titles.take(3))}. Which one do you mean?"
+                )
+                ItemMatch.None -> return EngineResult(
+                    Outcome.NEEDS_INFO,
+                    "I couldn't find ${target.trim()} in the plan. ${planTitlesSentence(s)}"
+                )
+            }
+            val edits = cmd.at != null || cmd.durationMin != null || cmd.priority != null || cmd.remove
+            if (!edits) {
+                return EngineResult(
+                    Outcome.NEEDS_INFO,
+                    "What would you like to change about ${one.title}? You can move it to another time, " +
+                        "change how long it takes or how important it is, or remove it."
+                )
+            }
+            val id = one.existingId
+            if (id != null) {
+                if (cmd.remove) {
+                    s = s.copy(skipped = s.skipped + id, pulled = s.pulled - id)
+                    said += "Left ${one.title} out of the plan."
+                } else {
+                    problems += "${one.title} is already on your list, so I can only leave it out of this plan. " +
+                        "You can change it after we finish."
+                }
+            } else {
+                val index = s.items.indexOfFirst { it.title.equals(one.title, ignoreCase = true) }
+                if (index >= 0 && cmd.remove) {
+                    s = s.copy(items = s.items.filterIndexed { i, _ -> i != index })
+                    said += "Removed ${one.title}."
+                } else if (index >= 0) {
+                    var spec = s.items[index]
+                    val minutes = cmd.durationMin
+                    if (minutes != null) {
+                        val error = durationError(minutes)
+                        if (error != null) problems += error
+                        else {
+                            spec = spec.copy(durationMin = minutes)
+                            said += "${one.title} now takes ${format.duration(minutes)}."
+                        }
+                    }
+                    val at = cmd.at
+                    if (at != null) {
+                        val length = spec.durationMin ?: TaskEstimator.durationFor(spec.title)
+                        val usable = usableStart(s.date, at, length, one.title, problems, "I left it where it was.")
+                        if (usable != null) {
+                            spec = spec.copy(at = usable)
+                            said += "${one.title} is now at ${format.clockTime(usable)}."
+                        }
+                    }
+                    val priority = cmd.priority
+                    if (priority != null) {
+                        spec = spec.copy(priority = priority)
+                        said += "${one.title} is now ${priority.label.lowercase()} priority."
+                    }
+                    s = s.copy(items = s.items.mapIndexed { i, item -> if (i == index) spec else item })
+                }
+            }
+        }
+
+        val lead = (said + problems).joinToString(" ").let { if (it.isEmpty()) "" else "$it " }
+        if (s.items.isEmpty() && existingFor(s).isEmpty()) {
+            dayPlan = s.copy(proposal = null)
+            return EngineResult(Outcome.NEEDS_INFO, "${lead}That leaves nothing to plan. What else is on your mind for ${format.day(s.date)}?")
+        }
+        if (s.items.isEmpty() && s.proposal == null) {
+            dayPlan = s
+            return EngineResult(Outcome.NEEDS_INFO, lead + planQuestion(s))
+        }
+        return proposeAndAsk(s, lead)
+    }
+
+    /** The user said yes: the proposed tasks are written to the list. */
+    private fun approvePlan(): EngineResult {
+        val open = dayPlan ?: return reject("There is no plan to add. Say plan my day to make one.")
+        val proposal = open.proposal
+        if (proposal == null) {
+            // Still waiting for the task list, and the user says that is everything.
+            if (open.items.isEmpty() && existingFor(open).isEmpty()) {
+                return EngineResult(
+                    Outcome.NEEDS_INFO,
+                    "There's nothing to plan yet. Tell me the tasks you want to fit into ${format.day(open.date)}."
+                )
+            }
+            return proposeAndAsk(open, "")
+        }
+        if (proposal.clashes.isNotEmpty()) {
+            val pairs = proposal.clashes.joinToString(" ") { (a, b) -> "$a and $b overlap." }
+            return EngineResult(
+                Outcome.NEEDS_INFO,
+                "I haven't added anything yet. $pairs Tell me a different time for one of them."
+            )
+        }
+
+        val now = clock.millis()
+        val fresh = proposal.newItems
+        // Time kept moving while the plan was being talked over: a slot that has begun is not a plan any more.
+        if (fresh.any { it.start < now }) {
+            return proposeAndAsk(open, "Some of those times have passed while we were talking, so I've moved things. ")
+        }
+        if (fresh.isEmpty()) {
+            dayPlan = null
+            return EngineResult(Outcome.OK, "Okay, your day is set. Everything in it was already on your list, so nothing changed.")
+        }
+
+        val inserted = mutableListOf<Task>()
+        try {
+            fresh.forEach { item ->
+                inserted += store.insert(
+                    Task(
+                        title = item.title,
+                        deadline = item.start,
+                        durationMin = item.durationMin,
+                        priority = item.priority,
+                        createdAt = now,
+                        reminderMin = dayPlanner.reminderFor(item.start, item.start, now)
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            // All or nothing: half a plan on the list would be worse than none.
+            inserted.forEach { store.delete(it.id) }
+            throw e
+        }
+        dayPlan = null
+        lastTaskId = inserted.last().id
+        undoAction = { inserted.forEach { store.delete(it.id) }; lastTaskId = null }
+
+        val called = inserted.count { it.reminderMin != null }
+        val reminder = when (called) {
+            inserted.size -> ", each with a reminder call shortly before it starts"
+            0 -> ""
+            else -> ", with reminder calls for $called of them"
+        }
+        val left = proposal.unplaced.filter { it.isNew }
+        val leftOut = if (left.isEmpty()) "" else " I left out ${naturalJoin(left.map { it.title })} because there wasn't room."
+        return EngineResult(
+            Outcome.OK,
+            "Done. I added ${naturalJoin(inserted.map { it.title })} for ${format.day(open.date)}, " +
+                "each due when its slot starts$reminder.$leftOut Say undo if you want them gone.",
+            taskIds = inserted.map { it.id },
+            changedTasks = true
+        )
+    }
+
+    /** Folds the tasks the user named into [base], refusing (and saying why) any that cannot be planned. */
+    private fun absorbItems(base: PlanSession, incoming: List<PlanItemSpec>): AbsorbedPlan {
+        val items = base.items.toMutableList()
+        var skipped = base.skipped
+        var pulled = base.pulled
+        val added = mutableListOf<String>()
+        val problems = mutableListOf<String>()
+        val open = store.all().filter { !it.isDone }
+        val dueThatDay = existingFor(base.copy(skipped = emptySet(), pulled = emptySet())).map { it.id }.toSet()
+
+        for (raw in incoming) {
+            val title = cleanTitle(raw.title)
+            if (title.isEmpty()) continue
+            if (title.length > Task.MAX_TITLE_LENGTH) {
+                problems += "That task name is too long."
+                continue
+            }
+            // A task the user already has is planned around, never added a second time.
+            val onList = open.firstOrNull { it.title.equals(title, ignoreCase = true) }
+            if (onList != null) {
+                skipped = skipped - onList.id
+                if (onList.id !in dueThatDay) pulled = pulled + onList.id
+                problems += "${onList.title} is already on your list, so I'll fit it in without adding it again."
+                continue
+            }
+            val known = items.indexOfFirst { it.title.equals(title, ignoreCase = true) }
+            if (known < 0 && items.size >= MAX_PLAN_ITEMS) {
+                problems += "I can plan up to $MAX_PLAN_ITEMS tasks at a time, so I left out $title."
+                continue
+            }
+
+            var minutes = raw.durationMin
+            val badLength = minutes?.let { durationError(it) }
+            if (badLength != null) {
+                problems += badLength
+                minutes = null
+            }
+            var at: LocalTime? = null
+            val wanted = raw.at
+            if (wanted != null) {
+                val length = minutes ?: TaskEstimator.durationFor(title)
+                at = usableStart(base.date, wanted, length, title, problems, "I'll fit it in wherever there's room.")
+            }
+
+            val spec = PlanItemSpec(title, minutes, raw.priority, at)
+            if (known >= 0) {
+                val old = items[known]
+                items[known] = old.copy(
+                    durationMin = spec.durationMin ?: old.durationMin,
+                    priority = spec.priority ?: old.priority,
+                    at = spec.at ?: old.at
+                )
+            } else {
+                items += spec
+            }
+            added += title
+        }
+        return AbsorbedPlan(base.copy(items = items, skipped = skipped, pulled = pulled), added, problems)
+    }
+
+    /** [at] on [date] if a task of [minutes] starting then still lies ahead and ends the same day; else says why not. */
+    private fun usableStart(
+        date: LocalDate,
+        at: LocalTime,
+        minutes: Int,
+        title: String,
+        problems: MutableList<String>,
+        otherwise: String
+    ): LocalTime? {
+        val start = resolver.at(date, at)
+        return when {
+            start < clock.millis() -> {
+                problems += "${format.deadline(start).replaceFirstChar { it.uppercase() }} has already passed. $otherwise"
+                null
+            }
+            start + minutes * MILLIS_PER_MINUTE > resolver.endOfDay(date) + 1 -> {
+                problems += "$title wouldn't finish before midnight if it started at ${format.clockTime(at)}. $otherwise"
+                null
+            }
+            else -> at
+        }
+    }
+
+    private fun tooLateToday(): Boolean =
+        clock.millis() + config.planLeadMin * MILLIS_PER_MINUTE >
+            resolver.at(resolver.today(), config.dayEndHour) - MIN_PLAN_ROOM_MIN * MILLIS_PER_MINUTE
+
+    /** Open tasks that belong in the day's plan: due that day (or overdue, for today), plus any the user named. */
+    private fun existingFor(s: PlanSession): List<Task> {
+        val start = resolver.startOfDay(s.date)
+        val end = resolver.endOfDay(s.date)
+        val isToday = s.date == resolver.today()
+        return store.all().filter { t ->
+            val due = t.deadline
+            !t.isDone && t.id !in s.skipped &&
+                (t.id in s.pulled || (due != null && (if (isToday) due <= end else due in start..end)))
+        }.sortedBy { it.deadline ?: Long.MAX_VALUE }
+    }
+
+    /** Works the day out and remembers it; the returned reply reads it back and asks what to do next. */
+    private fun proposeAndAsk(session: PlanSession, lead: String): EngineResult {
+        val built = buildProposal(session)
+        dayPlan = built.session
+        val proposal = built.session.proposal!!
+        val problems = built.problems.joinToString("") { "$it " }
+        return EngineResult(Outcome.NEEDS_INFO, lead + problems + narrate(built.session, proposal))
+    }
+
+    private fun buildProposal(s: PlanSession): Built {
+        val now = clock.millis()
+        val problems = mutableListOf<String>()
+        // A fixed time that has slipped into the past while talking can't be honoured; the task floats instead.
+        val items = s.items.map { item ->
+            val at = item.at
+            if (at != null && resolver.at(s.date, at) < now) {
+                val ms = resolver.at(s.date, at)
+                problems += "${format.deadline(ms).replaceFirstChar { it.uppercase() }} has already passed, " +
+                    "so I'll fit ${item.title} in wherever there's room."
+                item.copy(at = null)
+            } else item
+        }
+        val candidates = items.map { item ->
+            PlanCandidate(
+                title = item.title,
+                durationMin = item.durationMin ?: TaskEstimator.durationFor(item.title),
+                priority = item.priority ?: TaskEstimator.priorityFor(item.title),
+                at = item.at,
+                existing = null,
+                estimated = item.durationMin == null || item.priority == null
+            )
+        } + existingFor(s).map { t -> PlanCandidate(t.title, t.durationMin, t.priority, null, t, estimated = false) }
+        val proposal = dayPlanner.propose(s.date, candidates, s.startAt, now)
+        return Built(s.copy(items = items, proposal = proposal), problems)
+    }
+
+    private fun narrate(s: PlanSession, p: DayProposal): String {
+        val now = clock.millis()
+        val day = format.day(s.date)
+        val parts = mutableListOf("Here's your plan for $day.")
+        p.placed.forEach { parts += describe(it) }
+        if (p.unplaced.isNotEmpty()) {
+            val room = if (s.date == resolver.today()) "what's left of today" else day
+            parts += "I couldn't fit ${naturalJoin(p.unplaced.map { it.title })} into $room."
+        }
+        p.clashes.forEach { (a, b) -> parts += "$a and $b overlap." }
+
+        val fresh = p.newItems
+        if (fresh.isNotEmpty()) {
+            val without = fresh.filter { dayPlanner.reminderFor(it.start, it.start, now) == null }.map { it.title }
+            parts += when {
+                without.isEmpty() -> "Each new task is due when its slot starts, and I'll call you shortly before it starts."
+                without.size == fresh.size -> "Each new task is due when its slot starts. There isn't time for reminder calls."
+                else -> "Each new task is due when its slot starts. I'll call you shortly before each starts, " +
+                    "except for ${naturalJoin(without)}."
+            }
+            if (fresh.any { it.estimated }) {
+                parts += "I estimated how long things take and how important they are, so tell me if any is off."
+            }
+        }
+        parts += reviewQuestion(p)
+        return parts.joinToString(" ")
+    }
+
+    private fun describe(item: PlannedItem): String {
+        val times = item.blocks.joinToString(" and ") { rangeWord(it) }
+        val onList = if (item.isNew) "" else " It's already on your list."
+        val late = if (item.lateMin > 0) " That is ${format.minutes(item.lateMin)} after its deadline." else ""
+        return "${item.title}, $times, ${format.duration(item.durationMin)}, ${item.priority.label.lowercase()} priority.$onList$late"
+    }
+
+    /** "9 to 10 AM", or "11 AM to 1 PM" when the two ends fall on different sides of noon. */
+    private fun rangeWord(r: TimeRange): String {
+        val from = format.clockTime(r.start)
+        val to = format.clockTime(r.end)
+        return if (from.takeLast(2) == to.takeLast(2)) "${from.dropLast(3)} to $to" else "$from to $to"
+    }
+
+    private fun reviewQuestion(p: DayProposal): String = when {
+        p.clashes.isNotEmpty() -> "Tell me a different time for one of them."
+        p.newItems.isNotEmpty() -> "Say yes to add them, or tell me what to change."
+        p.unplaced.any { it.isNew } -> "Tell me what to shorten or drop, or another day to try."
+        else -> "Tell me any more tasks to add, or say that's all."
+    }
+
+    /** What the assistant is waiting for, worded so it can be repeated after an interruption. */
+    private fun planQuestion(s: PlanSession): String = when (s.stage) {
+        PlanStage.ASK_TASKS -> "What's on your mind for ${format.day(s.date)}? Tell me the tasks you want to fit in."
+        PlanStage.REVIEW -> reviewQuestion(s.proposal!!)
+    }
+
+    private fun planEntries(s: PlanSession): List<Pair<String, Long?>> {
+        val p = s.proposal
+        return if (p != null) (p.placed + p.unplaced).map { it.title to it.existingId } else s.items.map { it.title to null }
+    }
+
+    private fun planTitlesSentence(s: PlanSession): String {
+        val titles = planEntries(s).map { it.first }
+        return if (titles.isEmpty()) "There's nothing in the plan yet." else "The plan has ${naturalJoin(titles)}."
+    }
+
+    /** Which task in the plan a spoken name means, allowing for a misheard word the way the task list does. */
+    private fun matchPlanItem(s: PlanSession, query: String): ItemMatch {
+        val entries = planEntries(s)
+        val pool = entries.mapIndexed { i, e -> Task(id = i + 1L, title = e.first, createdAt = 0) }
+        return when (val m = TitleMatcher.resolve(query, pool)) {
+            is TitleMatcher.Match.Found -> entries[(m.task.id - 1).toInt()].let { ItemMatch.One(it.first, it.second) }
+            is TitleMatcher.Match.Ambiguous -> ItemMatch.Many(m.candidates.map { it.title })
+            TitleMatcher.Match.None -> ItemMatch.None
+        }
+    }
+
+    /** "Make the doctor 30 minutes" heard as an edit of a task: while planning it means the plan's task. */
+    private fun planEditFrom(cmd: TaskCommand.UpdateTask): TaskCommand.PlanChange? {
+        val s = dayPlan ?: return null
+        val ref = cmd.ref as? TaskRef.ByTitle ?: return null
+        val at = (cmd.patch.deadline as? DeadlineSpec.Relative)?.time
+        if (at == null && cmd.patch.durationMin == null && cmd.patch.priority == null) return null
+        val one = matchPlanItem(s, ref.query) as? ItemMatch.One ?: return null
+        return TaskCommand.PlanChange(one.title, at, cmd.patch.durationMin, cmd.patch.priority)
+    }
+
+    /** "Delete the doctor" while planning drops it from the plan; it must not delete a real task by surprise. */
+    private fun planDropFrom(cmd: TaskCommand.DeleteTask): TaskCommand.PlanChange? {
+        val s = dayPlan ?: return null
+        val ref = cmd.ref as? TaskRef.ByTitle ?: return null
+        val one = matchPlanItem(s, ref.query) as? ItemMatch.One ?: return null
+        return TaskCommand.PlanChange(one.title, remove = true)
+    }
+
+    private fun planItemOf(add: TaskCommand.AddTask) = PlanItemSpec(
+        title = add.title,
+        durationMin = add.durationMin,
+        priority = add.priority,
+        at = (add.deadline as? DeadlineSpec.Relative)?.time
+    )
+
+    private fun listTitles(tasks: List<Task>): String {
+        val shown = tasks.take(MAX_SPOKEN_ITEMS - 1).map { it.title }
+        val more = tasks.size - shown.size
+        return naturalJoin(if (more > 0) shown + "$more more" else shown)
+    }
+
+    // ---- replanning ----------------------------------------------------------------------
 
     private suspend fun replan(scope: PlanScope): EngineResult {
         val now = clock.millis()
@@ -1231,13 +1818,17 @@ class TaskEngine(
 
     private companion object {
         const val CAPABILITIES =
-            "I can tell you what's on today, add a task, move one to a different time, change how long " +
+            "I can tell you what's on today, add a task, plan your day, move one to a different time, change how long " +
                 "it takes or how important it is, mark one done, delete one, or replan your afternoon. " +
                 "What would you like to do?"
         const val MAX_SPOKEN_ITEMS = 4
         const val DRAFT_ID = -1L
         const val MAX_SUGGESTED_REMINDERS = 3
         const val MAX_SNOOZE_MIN = 24 * 60
+        const val MAX_PLAN_ITEMS = 12
+
+        /** A day with less than this left is not planned; the plan moves to tomorrow. */
+        const val MIN_PLAN_ROOM_MIN = 30
         const val MAX_CATCH_UP = 400
     }
 }

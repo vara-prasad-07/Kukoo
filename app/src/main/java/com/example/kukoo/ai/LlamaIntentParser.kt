@@ -8,7 +8,10 @@ import com.example.kukoo.domain.QuestionKind
 import com.example.kukoo.domain.DayRef
 import com.example.kukoo.domain.DeadlineSpec
 import com.example.kukoo.domain.DraftField
+import com.example.kukoo.domain.PlanItemSpec
 import com.example.kukoo.domain.PlanScope
+import com.example.kukoo.domain.PlanStage
+import com.example.kukoo.domain.PlanningState
 import com.example.kukoo.domain.Priority
 import com.example.kukoo.domain.QueryScope
 import com.example.kukoo.domain.Recurrence
@@ -24,6 +27,7 @@ import org.json.JSONObject
 import java.io.File
 import java.time.DayOfWeek
 import java.time.LocalTime
+import java.time.MonthDay
 
 /** Minimal text-completion surface the parser needs from a local LLM runtime. */
 interface LlamaEngine {
@@ -122,11 +126,15 @@ class LlamaIntentParser(
 
     private suspend fun tryLlm(utterance: String, context: ParseContext): TaskCommand? {
         if (utterance.isBlank() || !busy.tryLock()) return null
+        // A list of tasks takes the model far longer to write out than a one-word answer, so a planning
+        // turn (or a long sentence, which may carry the list) gets more time and room.
+        val long = context.planning != null || utterance.length > LONG_UTTERANCE
         return try {
-            withTimeoutOrNull(timeoutMs) {
+            withTimeoutOrNull(if (long) timeoutMs * PLAN_TIME_FACTOR else timeoutMs) {
                 withContext(Dispatchers.Default) {
                     if (!engine.ensureLoaded()) return@withContext null
-                    val raw = engine.complete(buildPrompt(utterance, context), MAX_TOKENS, LlamaGrammar.COMMAND_JSON)
+                    val budget = if (long) MAX_TOKENS_PLAN else MAX_TOKENS
+                    val raw = engine.complete(buildPrompt(utterance, context), budget, LlamaGrammar.COMMAND_JSON)
                     toCommand(raw, utterance, context)
                 }
             }
@@ -147,6 +155,7 @@ class LlamaIntentParser(
             append(INSTRUCTIONS)
             context.draft?.let { append("\n\n").append(draftSection(it, context.conflict)) }
             context.conflict?.let { append("\n\n").append(conflictSection(it)) }
+            context.planning?.let { append("\n\n").append(planningSection(it)) }
             append("\n\nOpen tasks:\n").append(titles)
             // The conversation is quoted inside the system text, not replayed as real assistant
             // turns. The assistant's replies are ordinary English ("Got it: half an hour. How
@@ -220,6 +229,26 @@ class LlamaIntentParser(
         ).joinToString("\n")
     }
 
+    /** Tells the model where the day-planning conversation stands, so "yes" and "make it shorter" mean something. */
+    private fun planningSection(state: PlanningState): String {
+        val tasks = if (state.taskTitles.isEmpty()) "none yet" else state.taskTitles.joinToString(" | ")
+        val asked = when (state.stage) {
+            PlanStage.ASK_TASKS -> "which tasks they want to fit into the day"
+            PlanStage.REVIEW -> "whether to add the plan it just proposed, or what to change"
+        }
+        return listOf(
+            "The user is planning ${state.dayLabel}. Tasks in the plan so far: $tasks.",
+            "The assistant just asked ${asked}.",
+            "- They name tasks: {\"action\":\"plan_tasks\",\"tasks\":[{\"title\":\"<task>\"}]}, one object per task, only the tasks named in this reply.",
+            "- They agree (yes, okay, sounds good, go ahead, add them) or say that is everything (that's all, nothing else): {\"action\":\"approve_plan\"}.",
+            "- They change one task in the plan: {\"action\":\"plan_change\",\"target\":\"<exact title from the plan>\"} plus \"time\", \"duration_min\" or \"priority\" as they said it, or \"remove\":true to drop it.",
+            "- They want the plan to start at a time: {\"action\":\"plan_change\",\"time\":\"HH:mm\"} with no target. Another day: plan_change with \"day\" or \"date\".",
+            "- They say no, or want a change without saying which: {\"action\":\"plan_change\"}.",
+            "- They want to stop planning (cancel, never mind): {\"action\":\"discard_task\"}.",
+            "- Use another action only if they clearly ask for something else."
+        ).joinToString("\n")
+    }
+
     /** Returns null when [raw] is not a valid, complete command (caller then falls back). */
     internal fun toCommand(raw: String, utterance: String, context: ParseContext = ParseContext()): TaskCommand? {
         val start = raw.indexOf('{')
@@ -230,6 +259,7 @@ class LlamaIntentParser(
         val expecting = context.expectedField()
         // After the assistant offered to move a task, a bare "10" is the new time.
         val bareTime = context.conflict?.forDraft == false
+        val planning = context.planning
 
         fun ref(): TaskRef? = when (val t = json.text("target")) {
             null -> null
@@ -244,8 +274,25 @@ class LlamaIntentParser(
         return when (action) {
             "add_task" -> newTask(json, utterance, pending, expecting)
             // An answer only means something while a question is open.
+            // With no task question open, an "answer" to the plan proposal is the yes it was waiting for.
             "answer" -> pending?.let { TaskCommand.FillTask(details(json, utterance, expecting)) }
-            "discard_task" -> if (pending != null) TaskCommand.DiscardDraft else null
+                ?: if (planning != null && Grounding.approvalGrounded(utterance)) TaskCommand.PlanApprove else null
+            "discard_task" -> if (pending != null || planning != null) TaskCommand.DiscardDraft else null
+            "plan_day" -> if (Grounding.planGrounded(utterance)) {
+                TaskCommand.PlanDay(dayOf(json, utterance), monthDay(json, utterance), planItems(json, utterance))
+            } else null
+            "plan_tasks" -> {
+                val items = planItems(json, utterance)
+                when {
+                    planning != null -> TaskCommand.PlanAdd(items)
+                    // With no plan open, a bare list of tasks is only a plan if the user said so.
+                    items.isNotEmpty() && Grounding.planGrounded(utterance) ->
+                        TaskCommand.PlanDay(dayOf(json, utterance), monthDay(json, utterance), items)
+                    else -> null
+                }
+            }
+            "plan_change" -> if (planning != null) planChange(json, utterance) else null
+            "approve_plan" -> if (planning != null && Grounding.approvalGrounded(utterance)) TaskCommand.PlanApprove else null
             "query_tasks" -> TaskCommand.QueryTasks(
                 if (json.text("scope")?.lowercase() == "all_open") QueryScope.ALL_OPEN else QueryScope.TODAY,
             )
@@ -285,6 +332,93 @@ class LlamaIntentParser(
             else -> null
         }
     }
+
+    private fun dayOf(json: JSONObject, utterance: String): DayRef? {
+        val name = json.text("day")?.lowercase() ?: return null
+        return dayRef(name)?.takeIf { Grounding.dayGrounded(name, utterance) }
+    }
+
+    /**
+     * "October 5th" as month and day only; the model's year is ignored (the engine picks the next such date).
+     * Accepts "2026-10-05" and "10-05".
+     */
+    private fun monthDay(json: JSONObject, utterance: String): MonthDay? {
+        val match = Regex("^(?:\\d{4}-)?(\\d{1,2})-(\\d{1,2})$").find(json.text("date") ?: return null) ?: return null
+        val month = match.groupValues[1].toInt()
+        val day = match.groupValues[2].toInt()
+        if (!Grounding.monthDayGrounded(month, day, utterance)) return null
+        return runCatching { MonthDay.of(month, day) }.getOrNull()
+    }
+
+    /**
+     * The tasks the user listed for a plan. Each title must be in the user's words, a comma the model left
+     * inside a title splits it into separate tasks, and a length, priority or time is kept only if the user
+     * named at least as many of them as the model attached: a single "an hour" cannot land on every task.
+     */
+    private fun planItems(json: JSONObject, utterance: String): List<PlanItemSpec> {
+        val entries = mutableListOf<JSONObject>()
+        val array = json.optJSONArray("tasks")
+        if (array != null) {
+            for (i in 0 until array.length()) {
+                when (val entry = array.opt(i)) {
+                    is JSONObject -> entries += entry
+                    is String -> entries += JSONObject().put("title", entry)
+                }
+            }
+        } else if (json.text("tasks") != null) {
+            json.text("tasks")!!.split(',').forEach { entries += JSONObject().put("title", it) }
+        } else {
+            json.text("title")?.let { entries += JSONObject().put("title", it) }
+        }
+
+        class Item(val title: String, val minutes: Int?, val priority: Priority?, val time: LocalTime?)
+
+        val items = mutableListOf<Item>()
+        for (entry in entries) {
+            val parts = (entry.text("title") ?: entry.text("name") ?: continue).split(',')
+            for (part in parts) {
+                val title = part.trim()
+                if (!Grounding.textGrounded(title, utterance) || Grounding.isPlanFiller(title)) continue
+                if (items.any { it.title.equals(title, ignoreCase = true) }) continue
+                // A title the model had to split was several tasks, so whatever it attached is a guess.
+                val single = parts.size == 1
+                items += Item(
+                    title,
+                    if (single) duration(entry, utterance) else null,
+                    if (single) priority(entry.text("priority"), utterance) else null,
+                    if (single) {
+                        entry.text("time")?.let(::modelTime)
+                            ?.takeIf { Grounding.timeGrounded(utterance, bare = false) }
+                            ?.let { Grounding.assumeAfternoon(it, utterance) }
+                    } else null
+                )
+            }
+        }
+        val keepMinutes = items.count { it.minutes != null } <= Grounding.durationPhraseCount(utterance)
+        val keepPriority = items.count { it.priority != null } <= Grounding.priorityWordCount(utterance)
+        val keepTime = items.count { it.time != null } <= Grounding.timeMarkerCount(utterance)
+        return items.take(MAX_PARSED_TASKS).map {
+            PlanItemSpec(
+                it.title,
+                it.minutes.takeIf { keepMinutes },
+                it.priority.takeIf { keepPriority },
+                it.time.takeIf { keepTime }
+            )
+        }
+    }
+
+    /** A change to the plan under review; each detail must be in the user's words, like everywhere else. */
+    private fun planChange(json: JSONObject, utterance: String): TaskCommand.PlanChange = TaskCommand.PlanChange(
+        target = json.text("target")?.takeIf { !it.equals("last", ignoreCase = true) },
+        at = json.text("time")?.let(::modelTime)
+            ?.takeIf { Grounding.timeGrounded(utterance, bare = false) }
+            ?.let { Grounding.assumeAfternoon(it, utterance) },
+        durationMin = duration(json, utterance),
+        priority = priority(json.text("priority"), utterance),
+        remove = json.optBoolean("remove", false) && Grounding.removeGrounded(utterance),
+        day = dayOf(json, utterance),
+        date = monthDay(json, utterance),
+    )
 
     private fun chatKind(name: String?): ChatKind? =
         ChatKind.entries.firstOrNull { it.name.equals(name, ignoreCase = true) }
@@ -410,6 +544,12 @@ class LlamaIntentParser(
         const val TAG = "LlamaIntentParser"
         const val MAX_TOKENS = 160
 
+        /** Room for a list of tasks, each an object of its own. */
+        const val MAX_TOKENS_PLAN = 360
+        const val PLAN_TIME_FACTOR = 3
+        const val LONG_UTTERANCE = 70
+        const val MAX_PARSED_TASKS = 20
+
         /** Enough for "move it to six" to resolve, short enough to keep the prompt fast. */
         const val MAX_HISTORY_TURNS = 6
 
@@ -422,9 +562,12 @@ class LlamaIntentParser(
             You turn one spoken sentence about a to-do list into ONE JSON object. Output the JSON only.
 
             Keys. Leave out every key the user did not clearly say. Never guess, invent or fill in a default.
-            "action": add_task, answer, discard_task, query_tasks, update_task, complete_task, reopen_task, delete_task, replan, undo, snooze, end_call, ask_what_to_change, check_conflicts, find_time, chat, unsupported
+            "action": add_task, answer, discard_task, query_tasks, update_task, complete_task, reopen_task, delete_task, replan, plan_day, plan_tasks, plan_change, approve_plan, undo, snooze, end_call, ask_what_to_change, check_conflicts, find_time, chat, unsupported
             "title": the task's name, in the user's own words
             "day": today, tomorrow, or monday..sunday
+            "date": "YYYY-MM-DD", only when the user names a calendar date such as the fifth of a month
+            "tasks": plan_day / plan_tasks only. A list with one object per task the user named: [{"title":"<task>"}]. An object may also carry "duration_min", "priority" and "time" if the user said them for that task.
+            "remove": true to take a task out of the plan (plan_change only)
             "time": "HH:mm" 24-hour. A bare hour from 1 to 7 means pm.
             "duration_min": whole minutes (an hour is 60)
             "priority": high, medium or low
@@ -450,6 +593,7 @@ class LlamaIntentParser(
             - check_conflicts: they ask whether any tasks overlap or clash ("any conflicts?", "am I double booked?").
             - find_time: they ask when they are free ("when am I free?", "when can I fit an hour?"). Include "duration_min" only if they named a length.
             - chat: a greeting, a thank-you, a bare acknowledgement ("okay", "yeah"), or asking what you can do. It looks like {"action":"chat","kind":"thanks"} — always include "action".
+            - plan_day: the user wants help planning a day ("plan my day", "help me plan tomorrow", "plan my day for friday"). Name the day with "day" or "date". Add "tasks" only if they listed tasks in the same sentence. Never use replan for this: replan only reschedules tasks that are already on the list.
             - Use unsupported only when nothing else fits.
         """.trimIndent()
     }

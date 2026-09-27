@@ -71,6 +71,15 @@ data class PlannerConfig(
     val afternoonStartHour: Int = 12,
     /** Suggested start times land on a multiple of this many minutes. */
     val slotMin: Int = 5,
+    /** Smallest slice a task may be split into when a day plan spreads it over two gaps. */
+    val minChunkMin: Int = 25,
     /** Start time used when only a day is given ("move it to tomorrow" on a task with no time). */
-    val defaultDeadlineHour: Int = 18
+    val defaultDeadlineHour: Int = 18,
+    /** "Plan my day" fills the whole waking day, not just office hours: gym at 7 AM is a normal plan. */
+    val dayStartHour: Int = 8,
+    val dayEndHour: Int = 21,
+    /** Breathing room left after each task in a day plan. */
+    val breakMin: Int = 10,
+    /** Today's plan never starts sooner than this after "now", so the first slot is not already under way. */
+    val planLeadMin: Int = 10
 )

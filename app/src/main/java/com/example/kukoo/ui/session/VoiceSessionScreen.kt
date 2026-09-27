@@ -87,6 +87,7 @@ import java.time.Clock
 private val SUGGESTIONS = listOf(
     "What's on today?",
     "Add a task",
+    "Plan my day",
     "Move the client deck to tomorrow",
     "Mark the follow-up as done",
     "Delete the expense task",
